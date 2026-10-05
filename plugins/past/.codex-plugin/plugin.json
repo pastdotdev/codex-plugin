@@ -1,0 +1,26 @@
+{
+  "name": "past",
+  "version": "0.1.0",
+  "description": "Your Codex sessions become memory, and every session starts briefed.",
+  "author": { "name": "past.dev", "url": "https://past.dev" },
+  "homepage": "https://github.com/pastdotdev/codex-plugin",
+  "repository": "https://github.com/pastdotdev/codex-plugin",
+  "license": "MIT",
+  "keywords": ["memory", "recall", "context", "past.dev"],
+  "hooks": "./hooks/hooks.json",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "past.dev",
+    "shortDescription": "Memory across your coding sessions",
+    "longDescription": "Your Codex sessions are read into a past.dev project when they are over, and every session and every prompt start with what past.dev recalls about the project: decisions, the reasons behind them, what was already tried. Only the prompts and the replies are sent, never tool output, file contents or diffs.",
+    "developerName": "past.dev",
+    "category": "Productivity",
+    "websiteURL": "https://past.dev",
+    "privacyPolicyURL": "https://past.dev/privacy",
+    "termsOfServiceURL": "https://past.dev/terms",
+    "defaultPrompt": [
+      "Use $past:status to show what past.dev is connected to and what it has sent",
+      "Use $past:search to find what we decided about this, and why"
+    ]
+  }
+}

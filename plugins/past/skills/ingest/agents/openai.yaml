@@ -1,0 +1,5 @@
+interface:
+  display_name: "Send a session to past"
+  short_description: "Send one session now"
+policy:
+  allow_implicit_invocation: false

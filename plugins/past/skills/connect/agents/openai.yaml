@@ -1,0 +1,5 @@
+interface:
+  display_name: "Connect past"
+  short_description: "Connect this machine to a project"
+policy:
+  allow_implicit_invocation: false
