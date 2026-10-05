@@ -1,0 +1,3 @@
+interface:
+  display_name: "Search past.dev"
+  short_description: "Search this project's history"
