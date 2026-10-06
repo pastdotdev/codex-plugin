@@ -1,0 +1,20 @@
+{
+  "name": "past",
+  "interface": {
+    "displayName": "past.dev"
+  },
+  "plugins": [
+    {
+      "name": "past",
+      "source": {
+        "source": "local",
+        "path": "./plugins/past"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

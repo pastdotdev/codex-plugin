@@ -1,0 +1,42 @@
+name: check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  script:
+    name: script on Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [14, 16, 22]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      # Node 16 is the floor. On an older Node the hooks only have to stay silent, so 14 parses it.
+      - name: Parses
+        run: node --check plugins/past/bin/past-hook.mjs
+      - name: Runs with nothing configured
+        if: matrix.node != 14
+        run: node plugins/past/bin/past-hook.mjs status --host codex
+        env:
+          HOME: ${{ runner.temp }}/home
+
+  manifests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # Codex has no validator. A manifest that does not parse loads no plugin, and says nothing.
+      - name: The manifests parse
+        run: |
+          for file in .agents/plugins/marketplace.json plugins/past/.codex-plugin/plugin.json plugins/past/hooks/hooks.json; do
+            node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' "$file" || exit 1
+            echo "$file"
+          done

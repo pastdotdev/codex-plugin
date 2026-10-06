@@ -1,0 +1,5 @@
+interface:
+  display_name: "Send the history to past.dev"
+  short_description: "Send the sessions already here"
+policy:
+  allow_implicit_invocation: false

@@ -1,0 +1,3 @@
+interface:
+  display_name: "past.dev status"
+  short_description: "What past.dev is connected to"
