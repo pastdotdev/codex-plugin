@@ -17,7 +17,8 @@ reasons behind them, what was already tried and dropped.
 ```
 
 That block is what Codex reads before your prompt. It arrives on its own: Codex does not have to
-decide to look anything up.
+decide to look anything up. When a request needs more than the block holds, Codex asks for it
+itself, with the `past_recall` tool the plugin serves.
 
 It runs in the Codex CLI and in local threads of the ChatGPT desktop app, on macOS and Linux.
 
@@ -69,12 +70,14 @@ environment instead of step 4. The desktop app reads them from a login shell, so
 ```text
 session opens    recall what past.dev knows about this project     ──►  into context
 every prompt     recall what past.dev knows about this prompt      ──►  into context
+any time         Codex asks past.dev itself, with past_recall      ──►  into context
 every reply      nothing is sent; the session is marked active
 compaction       the session so far is sent, before its detail is summarised away
 session over     the session is sent: its Codex process exited, or it was quiet for 12 hours
 ```
 
-Five hooks do this, and one script runs them all. A recall that has not answered within 4 seconds
+Five hooks and one tool do this, and one script runs them all. The block before a prompt holds
+up to ten memories; the tool returns up to a hundred, within 2,000 tokens. A recall that has not answered within 4 seconds
 (8 at session start) is dropped, so it never holds a prompt up, and a prompt shorter than 12
 characters ("yes", "go on") recalls nothing.
 

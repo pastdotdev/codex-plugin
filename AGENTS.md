@@ -10,12 +10,14 @@ in full in `plugins/past/README.md`; this file is the rules the code keeps, for 
 ```
 Codex
   hooks/hooks.json   five hooks          every one passes --host codex
+  .mcp.json          one MCP server      past_recall, the script's mcp mode
   skills/*           six skills          every command passes --host codex
             |
   bin/past-hook.mjs <mode> --host codex
             |
   session start   brief        recall into context; sends idle sessions left behind
-  every prompt    prompt       recall into context
+  every prompt    prompt       recall into context: ten memories, the block naming the tool
+  on demand       mcp          past_recall, the model's own recall, on a local MCP server
   every turn      stop         stamps the activity file, keeps one waiter on the session
   compaction      precompact   sends the session so far
   session end     end          makes sure a waiter runs
@@ -34,6 +36,7 @@ Codex
 plugins/past/
   .codex-plugin/plugin.json       the manifest: names the hooks file and the skills folder
   hooks/hooks.json                SessionStart, UserPromptSubmit, Stop, PreCompact, SessionEnd
+  .mcp.json                       past_recall: the script's mcp mode, started by Codex
   bin/past-hook.mjs               the whole connector, one file, no dependencies
   skills/                         search, status, connect, cut, ingest, backfill
   LICENSE                         the same license: an install copies this folder and nothing else
@@ -109,6 +112,16 @@ plugins/past/
     text from the sessions it sends, so a changed header would change how old sessions render and
     send them all again (rule 9). The hooks file keeps its status message, "Recalling from past", for
     the reason it is written once (see "The hooks file is written once").
+13. **The recall tool speaks JSON-RPC alone on stdout.** `mcp` mode is a stdio MCP server, started by
+    Codex from `.mcp.json` and alive as long as the session. Nothing else may print there: like
+    every mode it swallows its own failures, and a failed recall is a tool result that says so
+    (`isError`), never a crash. A call is one recall, redacted as every query is (rule 5), and reads
+    the same `~/.past/config.json`. Its page (up to a hundred memories within 2,000 tokens, each with
+    its moment, a "replaced" mark and the source excerpts) and the prompt hook's ten memories were
+    set by measurement: change them with a measurement. The block before a prompt names the tool in
+    one line, which is how the model learns to call it; the line rides inside a block the script
+    already drops from what it sends (rule 12), so it changes nothing that travels. Adding the server
+    touched neither `hooks/hooks.json` nor any hook's definition, so no person's trust is reset.
 
 ## Beside other past.dev plugins
 
@@ -182,11 +195,21 @@ activity files in `activity/codex/` and its hook stamp in `hosts/codex.json`. Th
   drawn from the item, `label` names the session, `metadata` carries `conversationId`,
   `sessionId`, `project`, `gitBranch`, `sitting`.
 - `POST /api/v1/recall` — **`identity` is required**. Recall stays off until `$past:connect` sets
-  one.
+  one. The prompt hook sends `limit` 10; the tool sends `limit` 100 and `maxTokens` 2,000, and reads
+  its sources' `excerpts` and `metadata.localTime` and its artifact's `supersededAt` besides each
+  result's `content` and `occurredAt`.
 - `audience` on ingest — a slug; absent means the whole project. `connect --audience` checks it
   with `GET /api/v1/audiences/{slug}`.
 - Codex gives a hook `session_id`, `transcript_path` and `cwd`, the prompt as `prompt`, and takes
   `hookSpecificOutput.additionalContext` at session start and on a prompt.
+- Codex starts a plugin's MCP server from the `mcpServers` file its manifest names. It expands
+  `${PLUGIN_ROOT}` in a hook's command but not in an MCP server's arguments, so `.mcp.json` names the
+  script relative to the plugin's root and sets `cwd` to `.`, which Codex resolves to that root. The
+  server's environment is Codex's short default list plus the names in `env_vars`, so `PAST_API_KEY`,
+  `PAST_IDENTITY` and `PAST_API_URL` are listed there. `default_tools_approval_mode: "approve"`
+  approves the one read-only tool in advance: `codex exec` approves nothing, and a person would be
+  asked at every call. The server runs outside the sandbox, so the tool reaches past.dev where a
+  skill's command would need an escalation.
 
 If any of these contracts changes, this file changes with it.
 
@@ -203,7 +226,9 @@ node plugins/past/bin/past-hook.mjs backfill --host codex   # the estimate, send
 For the hooks and the waiter, point a throwaway home at a local stand-in for the API, so nothing
 touches your real `~/.past` or a real project: `HOME=/tmp/past-test` with a `config.json` whose
 `apiUrl` is `http://127.0.0.1:<port>`, a few lines of Node answering `POST /api/v1/ingest/batch`, and the
-mode under test fed its stdin JSON by hand.
+mode under test fed its stdin JSON by hand. For the tool, pipe JSON-RPC lines (`initialize`,
+`tools/list`, `tools/call`) into `node plugins/past/bin/past-hook.mjs mcp` in the same home, with a
+stand-in answering `POST /api/v1/recall`, and check what the request carried.
 
 On a real Codex:
 
@@ -214,7 +239,8 @@ codex exec --dangerously-bypass-hook-trust "a prompt"     # runs the hooks for t
 ```
 
 `codex exec` waits on its input unless it is closed (`< /dev/null`), and fires `SessionEnd` at the
-end of every run. `CODEX_HOME=<a folder>` gives Codex a home of its own, enough for everything that
+end of every run. `codex mcp list` shows the plugin's server, `past`, with its working folder
+resolved to the installed plugin. `CODEX_HOME=<a folder>` gives Codex a home of its own, enough for everything that
 calls no model: installing, and asking the app server what it thinks of the hooks (`codex
 app-server`, then `hooks/list`), which is how to see a hook's key, its hash and whether it is
 trusted. The ChatGPT desktop app carries the same `codex` inside its bundle, for a machine that has

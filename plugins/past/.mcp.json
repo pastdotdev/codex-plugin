@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "past": {
+      "command": "node",
+      "args": ["bin/past-hook.mjs", "mcp"],
+      "cwd": ".",
+      "env_vars": ["PAST_API_KEY", "PAST_IDENTITY", "PAST_API_URL"],
+      "default_tools_approval_mode": "approve"
+    }
+  }
+}
