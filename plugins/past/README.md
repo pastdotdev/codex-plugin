@@ -47,7 +47,7 @@ is nothing to do: `$past:status` shows it.
 | Hook | When | What |
 |---|---|---|
 | `SessionStart` | a session opens | recalls this project's history and puts it in context |
-| `UserPromptSubmit` | every prompt | recalls against the prompt and puts it in context |
+| `UserPromptSubmit` | every prompt | recalls the ten memories closest to the prompt and puts them in context |
 | `Stop` | after each reply | stamps the session's activity; sends nothing itself |
 | `PreCompact` | the context is about to be compacted | sends the session so far, before the detail is summarised away |
 | `SessionEnd` | Codex unloads a session | makes sure the session will be sent; sends nothing itself |
@@ -93,7 +93,14 @@ Codex plugins carry skills rather than commands. Name one with `$`:
 | `$past:cut [session]` | print exactly what would be sent from this session, or from one you name |
 | `$past:ingest [session]` | send one session now |
 | `$past:backfill` | list and estimate, then send, the Codex sessions already on this machine |
-| `$past:search` | search past.dev on demand; Codex may pick it by itself when you ask about history |
+| `$past:search` | search past.dev from the terminal, for you; Codex uses its `past_recall` tool for itself |
+
+**And a recall tool.** The plugin also serves `past_recall`, on a small MCP server of its own
+(`.mcp.json`, run by the same script). The block before a prompt holds what was recalled for it;
+when the request depends on something that block does not hold, Codex calls `past_recall` with a
+question of its own and reads up to a hundred dated memories, within 2,000 tokens. Each call is one
+recall. The server runs outside Codex's sandbox, so it reaches past.dev without asking, and it only
+reads, so its tool is approved in advance. `codex mcp list` shows it as `past`.
 
 Codex runs a command in a sandbox with no network. The skills that reach past.dev ask for the
 permission, and Codex asks you. `connect`, `ingest` and `backfill` run only when you name them.

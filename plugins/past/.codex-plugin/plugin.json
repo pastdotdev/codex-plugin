@@ -1,6 +1,6 @@
 {
   "name": "past",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Your Codex sessions become memory, and every session starts briefed.",
   "author": { "name": "past.dev", "url": "https://past.dev" },
   "homepage": "https://github.com/pastdotdev/codex-plugin",
@@ -8,6 +8,7 @@
   "license": "MIT",
   "keywords": ["memory", "recall", "context", "past.dev"],
   "hooks": "./hooks/hooks.json",
+  "mcpServers": "./.mcp.json",
   "skills": "./skills/",
   "interface": {
     "displayName": "past.dev",
