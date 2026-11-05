@@ -49,19 +49,22 @@ is nothing to do: `$past:status` shows it.
 | `SessionStart` | a session opens | recalls this project's history and puts it in context |
 | `UserPromptSubmit` | every prompt | recalls the ten memories closest to the prompt and puts them in context |
 | `Stop` | after each reply | stamps the session's activity; sends nothing itself |
-| `PreCompact` | the context is about to be compacted | sends the session so far, before the detail is summarised away |
+| `PreCompact` | the context is about to be compacted | sends the sittings that closed since the last send; the one still open at most once an hour |
 | `SessionEnd` | Codex unloads a session | makes sure the session will be sent; sends nothing itself |
 
 **When a session is sent.** Codex says a session ended even when it only went quiet for half an
 hour, so the plugin does not send on that. A session is sent within a minute after the Codex
 process that ran it exits (the end of a `codex exec` run, the desktop app when you quit it), or
-after 12 hours without a new turn (`idleMinutes`). It is sent before a compaction too.
+after 12 hours without a new turn (`idleMinutes`). Before a compaction, the sittings that closed
+since the last send go too, and the one still open at most once an hour.
 
 `SessionStart` also sends any earlier session that never reached past.dev and has gone idle, which is
 what covers a crash or a machine that slept.
 
 **A session is sent in sittings.** A new sitting starts where the session went quiet for 30
-minutes (`sittingMinutes`): nobody wrote and Codex ran nothing. Each sitting is dated at its own
+minutes (`sittingMinutes`): nobody wrote and Codex ran nothing. One also starts once the sitting
+so far holds 50 KB of prose (`sittingKilobytes`), after Codex's reply, so a thread that never pauses
+is cut all the same. Each sitting is dated at its own
 first turn, and what past.dev remembers takes the date of the sitting it came from, so something said
 on the third day of a thread that ran for three days is dated that day. A prompt and its reply stay
 together while Codex works on it, however long. When a session continues, only its last sitting
@@ -122,6 +125,7 @@ narrows it to an audience from the console; `--audience project` widens it back.
   "ingest": true,
   "idleMinutes": 720,
   "sittingMinutes": 30,
+  "sittingKilobytes": 50,
   "deny": ["/Users/you/clients/acme"]
 }
 ```
@@ -133,6 +137,9 @@ narrows it to an audience from the console; `--audience project` widens it back.
 - `sittingMinutes` is how long a session stays quiet before what follows starts a new sitting (30
   by default, 5 at least). Shorter dates what past.dev remembers more closely, in more and smaller
   data points. A session keeps the length it was first sent with.
+- `sittingKilobytes` is how much prose a sitting holds before the next turn starts a new one (50
+  by default, 10 at least), the cut waiting for Codex's reply. A session keeps the size it was
+  first sent with.
 - `deny` holds path fragments. A session whose working directory matches one is ignored
   completely — nothing is read and nothing is sent.
 - `PAST_API_KEY`, `PAST_IDENTITY` and `PAST_API_URL` override the file.
@@ -164,3 +171,12 @@ console.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Credits
+
+After `402 out-of-credits`, the plugin pauses the refused operation and keeps unsent data locally.
+A write refusal does not pause recall. A recall refusal pauses recall separately.
+On later calls, the plugin checks the balance at most once per five minutes for each paused operation.
+The plugin resumes when the balance covers the refused call. The server checks the balance again for each request.
+Run `$past:status --refresh` after you add credits to check the balance now.
+A new API key or API URL starts with no pause from the previous connection.
