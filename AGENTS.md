@@ -19,7 +19,7 @@ Codex
   every prompt    prompt       recall into context: ten memories, the block naming the tool
   on demand       mcp          past_recall, the model's own recall, on a local MCP server
   every turn      stop         stamps the activity file, keeps one waiter on the session
-  compaction      precompact   sends the session so far
+  compaction      precompact   sends the sittings that closed; the one still open at most once an hour
   session end     end          makes sure a waiter runs
   detached        idle         the waiter: sends once Codex's process is gone, or after idleMinutes
             |
@@ -43,6 +43,11 @@ plugins/past/
 .github/workflows/check.yml       every pull request: the script parses and runs, the manifests parse
 ```
 
+Credit refusals persist per operation in this host's state book, under `creditPauses`.
+Each pause stores a connection fingerprint, required credits, and the next balance check time.
+Use `updateState` for every change. Keep transcript hashes and pending sessions intact on a refusal.
+`status --refresh` reads `/api/v1/usage` before it clears a pause. A write pause leaves recall available.
+
 ## The script
 
 `bin/past-hook.mjs` is the whole plugin. The rules it keeps:
@@ -65,7 +70,11 @@ plugins/past/
    gone or the last turn is `idleMinutes` old (720 by default). `ensureWaiters` (`Stop`,
    `SessionStart`, `$past:status`) replaces a waiter that died or that an older `WAITER_VERSION`
    started (bump it whenever the waiter changes), and a replacement past its deadline sends at
-   once. `PreCompact` sends before the context is summarised. `SessionStart` sends the idle
+   once. `PreCompact` sends the sittings that closed since the last send, once each, and the one
+   still open only when the session's last send is an hour old (`COMPACTION_RESEND_MS`): a session
+   that never goes quiet compacts every few minutes, and sent whole at each one it was a new paid
+   revision every time, while the transcript on disk loses nothing. The held sitting keeps its old
+   hash in `state.json`, so it goes with the waiter's send. `SessionStart` sends the idle
    sessions that never reached past.dev, and `tidyPending` drops an open session that is gone, empty,
    or in past.dev unchanged and idle. Why `SessionEnd` sends nothing is under "Codex" below.
 5. **A recall query is redacted like the content it would send.** It crosses the network exactly
@@ -90,8 +99,8 @@ plugins/past/
 9. **What is sent for a session does not change by a byte.** The heading and the speaker names
    that `renderTranscript` prints are part of the content hash, and so are `SOURCE`, `AGENT` and
    `SPEAKER` at the top of the script: a changed byte makes `backfill` send every session already
-   in past.dev again, as a paid revision. `sittingId` and the cut (`sittingsOf`, `silenceMeter`) are
-   fixed too: changed, they move the boundaries of every session that grows afterwards, and the old
+   in past.dev again, as a paid revision. `sittingId` and the cut (`sittingsOf`, `silenceMeter`, the size
+   measured on the turns' own text) are fixed too: changed, they move the boundaries of every session that grows afterwards, and the old
    sittings stay in past.dev beside the new ones.
 10. **`~/.past` is the person's alone.** The folder is `700` and every file in it is created
     `600`, never written open and narrowed afterwards. A plain-http `apiUrl` on another machine
@@ -100,9 +109,14 @@ plugins/past/
     decides which of two statements is the later from those times. A sitting starts at the first
     turn after the thread was silent for `sittingMinutes` (30 by default, 5 at least), whoever
     speaks; tool calls and their output count as activity, so a prompt stays with its reply while
-    Codex works. Each sitting is one data point timed at its first turn, and every changed sitting
-    goes in one `/api/v1/ingest/batch` call. `state.json` pins `sittingMinutes` per session at its
-    first send, so a changed value never moves the boundaries of a session already in past.dev.
+    Codex works. One also starts once the sitting so far holds `sittingKilobytes` of prose (50 by
+    default, 10 at least), measured on the turns' own text and only once Codex has answered, so a
+    thread that never goes quiet is cut all the same and a prompt is never parted from its first
+    answer. Each sitting is one data point timed at its first turn, and every changed sitting
+    goes in one `/api/v1/ingest/batch` call. `state.json` pins `sittingMinutes` and
+    `sittingKilobytes` per session at its first send, so a changed value never moves the boundaries
+    of a session already in past.dev; one sent in sittings before the size existed is pinned to no
+    size (`0`).
 
 12. **The product is written past.dev.** Every sentence a person reads says past.dev: the READMEs,
     the manifest's display names, the skills' text, what a mode prints. Identifiers keep `past`:
