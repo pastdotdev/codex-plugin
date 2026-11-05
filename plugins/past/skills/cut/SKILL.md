@@ -25,7 +25,7 @@ Run it from this skill's folder: the path is relative to it. It only reads, so i
 Show the user the result. This is what leaves the machine: the prompts and the replies, with
 secrets redacted. Tool output, file contents, diffs and what Codex or a hook injected are not in
 it. A session is sent in sittings, one data point each: a new one starts where the conversation
-went quiet for `sittingMinutes` (30 by default), and each begins with its own heading. The first line names the
+went quiet for `sittingMinutes` (30 by default) or past `sittingKilobytes` of prose (50 by default), and each begins with its own heading. The first line names the
 session and its sittings, and reports the size on disk, the size sent and what sending it now
 costs. The last line says what happens next. Relay that line as it is.
 
