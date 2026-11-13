@@ -136,6 +136,20 @@ Use `updateState` for every change. Keep transcript hashes and pending sessions 
     one line, which is how the model learns to call it; the line rides inside a block the script
     already drops from what it sends (rule 12), so it changes nothing that travels. Adding the server
     touched neither `hooks/hooks.json` nor any hook's definition, so no person's trust is reset.
+14. **A sitting is sent with the connection it was typed under.** `state.json` keeps, per session,
+    the connections its prompts were typed under (`connections`, under `hosts.codex`: a fingerprint of the key and the
+    address, empty while the machine has no key, each with the time it began; the first covers the
+    session from its start). Every hook of a session records a change (`noteConnection`), and
+    `connect` does for the sessions still open. A prompt typed under another connection than its
+    sitting's starts a new sitting, and a sitting is sent only while its connection is the one in
+    force, whichever way the send starts (a hook, the waiter, `ingest`, `backfill`); `cut` does not
+    print the others. So what a person typed before connecting, or under another project's key,
+    stays on the machine. A session the hooks kept no record of, one from before the plugin was
+    installed or before 0.4.1, names no connection: it is cut and sent as it was, so nothing
+    already in past.dev moves, and `backfill` still sends the history. A sitting kept back holds its
+    last hash in `sittings`, or `null`, and the session's whole hash is written only once every
+    sitting is in past.dev. The folder's path is never sent: `metadata.project` is the folder's
+    name. `WAITER_VERSION` went to 7 with it.
 
 ## Beside other past.dev plugins
 

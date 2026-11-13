@@ -42,5 +42,6 @@ once. It is not the project's id or handle, and not the organization's managemen
 
 After it succeeds, tell the user three things: Codex runs the past.dev hooks only once they are
 trusted (`/hooks` in a terminal session, or **Trust all** on the past.dev plugin's page in the ChatGPT
-desktop app); new sessions are read from then on; and `$past:backfill` sends the Codex history
-already on this machine.
+desktop app); sessions are read from their next prompt on, so what they typed before connecting
+stays on this machine; and `$past:backfill` sends the Codex sessions from before the plugin was
+installed.

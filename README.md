@@ -58,8 +58,9 @@ You need Codex and Node 16 or later.
 5. **Check it.** `$past:status` shows the project it talks to, when its hooks last ran and what it
    has sent.
 
-New sessions are read from then on. `$past:backfill` lists the Codex sessions already on this
-machine, estimates what sending them costs, and sends them when you confirm.
+Sessions are read from your next prompt on: what you typed before connecting stays on your machine.
+`$past:backfill` lists the Codex sessions from before the plugin was installed, estimates what
+sending them costs, and sends them when you confirm.
 
 To keep the key out of the conversation, set `PAST_API_KEY` and `PAST_IDENTITY` in your
 environment instead of step 4. The desktop app reads them from a login shell, so put them in
@@ -99,7 +100,15 @@ tried before.
 
 ## What leaves your machine
 
-Your prompts, Codex's replies, and the project and branch names. Nothing else.
+Your prompts and Codex's replies, with the names of the project's folder and its branch, the
+session's id and the identity you connected with. The folder's path stays on your machine. Recall
+sends queries: one when a session starts, the first 1,000 characters of each prompt, and the
+questions Codex asks `past_recall`. Nothing else.
+
+What you type is sent with the key it was typed under, and with no other. Nothing typed before you
+connect is sent, and what was typed under one project's key never goes to another project: a
+session goes on, in a new sitting, from the prompt after you connect or change keys. Sessions from
+before the plugin was installed are your history, sent only when you run `$past:backfill`.
 
 Never sent: tool calls and their output, file contents, diffs, command output, subagent threads,
 and anything Codex or a hook injected rather than a person typing it. Strings that look like keys,
