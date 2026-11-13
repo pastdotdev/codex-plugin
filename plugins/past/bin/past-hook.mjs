@@ -354,6 +354,17 @@ function sittingsOf(parsed, minutes, kilobytes, spans) {
   return sittings;
 }
 
+// The model a sitting ran on and its reasoning effort, as its last turn has them: what Codex was
+// set to when the sitting was last sent. Neither is part of the rendered content, so they change no
+// hash, and a transcript that names none adds nothing to the request.
+function ranOn(sitting) {
+  const last = sitting.turns[sitting.turns.length - 1] || {};
+  const ran = {};
+  if (last.model) ran.model = last.model;
+  if (last.effort) ran.effort = last.effort;
+  return ran;
+}
+
 /** The first sitting keeps the id a whole session had, so a session first sent whole is replaced, not doubled. */
 function sittingId(sessionId, index) {
   return `${SOURCE}:${sessionId}` + (index ? `:${index + 1}` : '');
@@ -805,6 +816,7 @@ async function ingestSession(config, state, sessionId, transcriptPath, context, 
           gitBranch: branch || '',
           sitting: part.index + 1,
           turns: part.sitting.turns.length,
+          ...ranOn(part.sitting),
         },
       };
     }),
@@ -1257,6 +1269,8 @@ function readTranscript(path) {
   let branch = '';
   let project = '';
   let cwd = '';
+  let model = '';
+  let effort = '';
   let raw = '';
   try { raw = readFileSync(path, 'utf8'); } catch { return null; }
   const silence = silenceMeter();
@@ -1290,6 +1304,12 @@ function readTranscript(path) {
     }
     if (copying && !copyEnds) copyEnds = (Date.parse(entry.timestamp) || 0) + COPY_WRITE_MS;
     if (copyEnds && !(Date.parse(entry.timestamp) > copyEnds)) continue;
+    // Before each turn Codex writes what it runs on: the model, and the reasoning effort where one
+    // is set. Each turn keeps the latest, for the sitting's metadata.
+    if (entry.type === 'turn_context') {
+      if (typeof payload.model === 'string' && payload.model) model = payload.model.slice(0, 100);
+      effort = typeof payload.effort === 'string' ? payload.effort.slice(0, 40) : '';
+    }
     // Every item of the conversation is activity, tool calls and their output included.
     if (entry.type === 'response_item') silence.seen(entry.timestamp);
     // Everything else in the file is machinery: tool calls and their output, reasoning, the copy
@@ -1310,7 +1330,7 @@ function readTranscript(path) {
     if (!text || text.trim().length < 2 || isSynthetic(text)) continue;
 
     if (!firstAt && entry.timestamp) firstAt = entry.timestamp;
-    turns.push({ role: payload.role, at: entry.timestamp || '', text: text.trim(), quiet: silence.take() });
+    turns.push({ role: payload.role, at: entry.timestamp || '', text: text.trim(), quiet: silence.take(), model, effort });
   }
 
   if (!turns.length) return null;

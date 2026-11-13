@@ -221,7 +221,11 @@ activity files in `activity/codex/` and its hook stamp in `hosts/codex.json`. Th
 - `POST /api/v1/ingest/batch` — one item per sitting. `id` gives replacement (`codex:<thread id>`
   for the first sitting, `codex:<thread id>:<n>` for the others), `timestamp` dates every memory
   drawn from the item, `label` names the session, `metadata` carries `conversationId`,
-  `sessionId`, `project`, `gitBranch`, `sitting`.
+  `sessionId`, `project`, `gitBranch`, `sitting`, and `model` and `effort` where the transcript
+  names them.
+- Codex writes a `turn_context` line before each turn, with the `model` it runs on and, where one is
+  set, the reasoning `effort`. A sitting carries what its last turn ran on; neither is rendered, so
+  neither changes a hash (rule 9).
 - `POST /api/v1/recall` — **`identity` is required**. Recall stays off until `$past:connect` sets
   one. The prompt hook sends `limit` 10; the tool sends `limit` 100 and `maxTokens` 2,000, and reads
   its sources' `excerpts` and `metadata.localTime` and its artifact's `supersededAt` besides each

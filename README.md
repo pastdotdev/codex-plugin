@@ -101,7 +101,8 @@ tried before.
 ## What leaves your machine
 
 Your prompts and Codex's replies, with the names of the project's folder and its branch, the
-session's id and the identity you connected with. The folder's path stays on your machine. Recall
+session's id, the model Codex ran on with its reasoning effort, and the identity you connected
+with. The folder's path stays on your machine. Recall
 sends queries: one when a session starts, the first 1,000 characters of each prompt, and the
 questions Codex asks `past_recall`. Nothing else.
 
