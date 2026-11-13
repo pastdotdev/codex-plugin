@@ -42,7 +42,7 @@ const MIN_SITTING_KILOBYTES = 10;
 const COMPACTION_RESEND_MS = 60 * 60000;
 const DEFAULT_API_URL = 'https://api.past.dev';
 const MARKER = '=== past · recalled from memory ===';
-const VERSION = '0.4.0';
+const VERSION = '0.4.1';
 
 // ---------------------------------------------------------------------------------------- Codex
 
@@ -139,8 +139,8 @@ function saveConfig(next) {
 function loadState() { return readJson(STATE_PATH, {}); }
 
 /**
- * This plugin's sessions in the state: `sessions` that were sent, `pending` ones still open, under
- * `hosts.codex`. The rest of the file can belong to another past.dev plugin on this machine; it is never
+ * This plugin's sessions in the state: `sessions` that were sent, `pending` ones still open and the
+ * `connections` each was typed under, under `hosts.codex`. The rest of the file can belong to another past.dev plugin on this machine; it is never
  * read here, and every write puts it back as it was.
  */
 function book(state) {
@@ -151,6 +151,7 @@ function book(state) {
   const own = state.hosts.codex;
   if (!own.sessions) own.sessions = {};
   if (!own.pending) own.pending = {};
+  if (!own.connections) own.connections = {};
   return own;
 }
 
@@ -322,8 +323,9 @@ function silenceMeter() {
 // where the transcript records one per turn, and the whole session keeps its last: a switch later
 // in the session then changes no sitting already closed. A session only grows at its end, so a
 // sitting never changes once the next one has begun, and a session that resumes sends its last
-// sitting again, not the whole.
-function sittingsOf(parsed, minutes, kilobytes) {
+// sitting again, not the whole. A prompt typed under another connection than the sitting's starts a
+// new one too (`spans`, the session's record in state.json): a sitting belongs to one connection.
+function sittingsOf(parsed, minutes, kilobytes, spans) {
   const sittings = [];
   let held = 0;
   let previous = null;
@@ -331,12 +333,17 @@ function sittingsOf(parsed, minutes, kilobytes) {
     const quiet = turn.quiet >= minutes * 60000;
     // Measured on the turns' own text, so the cut moves with neither the heading nor the redaction.
     const full = kilobytes > 0 && held >= kilobytes * 1024 && previous !== null && previous.role !== 'user';
-    if (!sittings.length || (turn.at && (quiet || full))) {
+    const open = sittings[sittings.length - 1];
+    // The agent's turns stay with the prompt they answer, whatever was connected meanwhile.
+    const connection = open && turn.role !== 'user' ? open.connection : connectionAt(spans, turn.at, open && open.connection);
+    const moved = Boolean(open) && connection !== open.connection;
+    if (!open || (turn.at && (quiet || full || moved))) {
       sittings.push({
         ...parsed,
         turns: [],
         firstAt: sittings.length ? turn.at : parsed.firstAt,
         branch: turn.branch || parsed.branch,
+        connection,
       });
       held = 0;
     }
@@ -347,12 +354,60 @@ function sittingsOf(parsed, minutes, kilobytes) {
   return sittings;
 }
 
+// The model a sitting ran on and its reasoning effort, as its last turn has them: what Codex was
+// set to when the sitting was last sent. Neither is part of the rendered content, so they change no
+// hash, and a transcript that names none adds nothing to the request.
+function ranOn(sitting) {
+  const last = sitting.turns[sitting.turns.length - 1] || {};
+  const ran = {};
+  if (last.model) ran.model = last.model;
+  if (last.effort) ran.effort = last.effort;
+  return ran;
+}
+
 /** The first sitting keeps the id a whole session had, so a session first sent whole is replaced, not doubled. */
 function sittingId(sessionId, index) {
   return `${SOURCE}:${sessionId}` + (index ? `:${index + 1}` : '');
 }
 
 const hashOf = (text) => createHash('sha256').update(text).digest('hex');
+
+// A fingerprint of the key and address this machine is connected with, empty while it has none.
+// state.json keeps, per session, the connections its prompts were typed under (`connections`), and
+// a sitting is sent with the connection it was typed under and with no other: what a person typed
+// before connecting, or under another project's key, stays on this machine.
+const connectionOf = (config) => (config.apiKey ? hashOf(`${config.apiUrl}\n${config.apiKey}`).slice(0, 16) : '');
+
+/**
+ * Records the connection a session's next prompts are typed under, when it is not the one recorded
+ * last. The first record covers the session from its start. Every hook of a session calls this, and
+ * `connect` does for the sessions still open, so a new connection holds from the prompt after it.
+ */
+function noteConnection(config, sessionId, state) {
+  if (!sessionId) return;
+  const connection = connectionOf(config);
+  const last = (spans) => (Array.isArray(spans) && spans.length ? spans[spans.length - 1].connection : undefined);
+  if (last(book(state || loadState()).connections[sessionId]) === connection) return;
+  const at = Date.now();
+  updateState((fresh) => {
+    const all = book(fresh).connections;
+    const spans = Array.isArray(all[sessionId]) ? all[sessionId] : [];
+    if (last(spans) !== connection) all[sessionId] = spans.concat({ at: spans.length ? at : 0, connection });
+  }, state);
+}
+
+/**
+ * The connection a turn was typed under: the last one recorded before it. A session the hooks kept
+ * no record of (one from before the plugin was installed) has none, and is sent as backfill sends it.
+ */
+function connectionAt(spans, at, fallback) {
+  if (!Array.isArray(spans) || !spans.length) return undefined;
+  const time = Date.parse(at);
+  if (Number.isNaN(time)) return fallback !== undefined ? fallback : spans[0].connection;
+  let found = spans[0].connection;
+  for (const span of spans) if (span.at <= time) found = span.connection;
+  return found;
+}
 
 /**
  * What sending a session carries now: each sitting rendered, and the ones past.dev does not hold yet.
@@ -362,29 +417,38 @@ const hashOf = (text) => createHash('sha256').update(text).digest('hex');
  * keeps the sitting length and size it was first sent with (`sittingMinutes`, `sittingKilobytes`):
  * a new value in the config applies to the sessions sent after it, and the boundaries of one
  * already in past.dev never move. One sent in sittings before the size existed keeps no size at all.
+ * `changed` holds the sittings to send; `kept` the ones that differ too but were typed under another
+ * connection, or under none, and stay on this machine (`spans`, the session's record of them).
  */
-function planSend(parsed, context, sent, config) {
+function planSend(parsed, context, sent, config, spans) {
   const pinned = Boolean(sent && sent.sittingMinutes);
   const minutes = pinned ? sent.sittingMinutes : config.sittingMinutes;
   const kilobytes = pinned ? (Number(sent.sittingKilobytes) || 0) : config.sittingKilobytes;
-  const sittings = sittingsOf(parsed, minutes, kilobytes).map((sitting, index) => {
+  const sittings = sittingsOf(parsed, minutes, kilobytes, spans).map((sitting, index) => {
     const content = renderTranscript(sitting, context);
     return { index, sitting, content, hash: hashOf(content), bytes: Buffer.byteLength(content) };
   });
   const whole = hashOf(renderTranscript(parsed, context));
   const known = sent && Array.isArray(sent.sittings) ? sent.sittings : [];
-  if (sent && sent.hash === whole) return { whole, minutes, kilobytes, sittings, known, changed: [] };
-  return { whole, minutes, kilobytes, sittings, known, changed: sittings.filter((part) => known[part.index] !== part.hash) };
+  if (sent && sent.hash === whole) return { whole, minutes, kilobytes, sittings, known, changed: [], kept: [] };
+  const connection = connectionOf(config);
+  const mine = (part) => part.sitting.connection === undefined || (connection !== '' && part.sitting.connection === connection);
+  const differing = sittings.filter((part) => known[part.index] !== part.hash);
+  return {
+    whole, minutes, kilobytes, sittings, known,
+    changed: differing.filter(mine),
+    kept: differing.filter((part) => !mine(part)),
+  };
 }
 
-// Which project, branch and directory a session belongs to. A Codex transcript says so itself, and
-// is believed over the caller, so that a session reads the same, and hashes the same, wherever it is
-// sent from: Codex runs a skill's command in the skill's own folder.
+// Which project and branch a session belongs to. A Codex transcript says so itself, and is believed
+// over the caller, so that a session reads the same, and hashes the same, wherever it is sent from:
+// Codex runs a skill's command in the skill's own folder. The folder's name is the project; its
+// path never leaves this machine.
 function placeOf(parsed, context) {
   return {
     project: parsed.project || context.project || '',
     branch: parsed.branch || context.branch || '',
-    cwd: parsed.cwd || context.cwd || '',
   };
 }
 
@@ -712,7 +776,7 @@ async function ingestSession(config, state, sessionId, transcriptPath, context, 
   }
 
   const before = sessions[sessionId];
-  const plan = planSend(parsed, context, before, config);
+  const plan = planSend(parsed, context, before, config, book(state).connections[sessionId]);
   // A compaction sends the sittings that closed since the last send, once each, and holds the one
   // still open unless the session's last send is an hour old: that sitting grows at every turn,
   // and sent at every compaction it was a new paid revision of itself every few minutes. Its turns
@@ -727,7 +791,7 @@ async function ingestSession(config, state, sessionId, transcriptPath, context, 
     // Unchanged still closes the session out. Without this it stays pending, and every later
     // SessionStart re-reads and re-hashes a transcript that is already in past.dev.
     if (!stillRunning && pending[sessionId]) updateState((fresh) => { delete book(fresh).pending[sessionId]; }, state);
-    return { skipped: held ? 'held' : 'unchanged' };
+    return { skipped: held ? 'held' : plan.kept.length ? 'kept' : 'unchanged', kept: plan.kept.length };
   }
 
   const place = placeOf(parsed, context);
@@ -749,10 +813,10 @@ async function ingestSession(config, state, sessionId, transcriptPath, context, 
           conversationId: sessionId,
           sessionId,
           project: place.project,
-          cwd: place.cwd,
           gitBranch: branch || '',
           sitting: part.index + 1,
           turns: part.sitting.turns.length,
+          ...ranOn(part.sitting),
         },
       };
     }),
@@ -767,11 +831,13 @@ async function ingestSession(config, state, sessionId, transcriptPath, context, 
     return { error: result ? result.error : 'unreachable', code };
   }
   // A held sitting keeps the hash it was last sent with, or none, so it goes at the next send, and
-  // the whole hash is written only once the whole session is in past.dev.
+  // the whole hash is written only once the whole session is in past.dev. A sitting kept on this
+  // machine keeps its last hash, or none, the same way: it is never in past.dev as it is now.
   const hashes = plan.sittings.map((part) => part.hash);
+  for (const part of plan.kept) hashes[part.index] = plan.known[part.index] || null;
   if (held) { if (plan.known[held.index]) hashes[held.index] = plan.known[held.index]; else hashes.pop(); }
   const sent = {
-    hash: held ? before.hash : plan.whole,
+    hash: held || plan.kept.length ? (before ? before.hash : undefined) : plan.whole,
     sittings: hashes,
     sittingMinutes: plan.minutes,
     sittingKilobytes: plan.kilobytes,
@@ -791,6 +857,7 @@ async function ingestSession(config, state, sessionId, transcriptPath, context, 
     sittings: plan.sittings.length,
     sent: parts.length,
     held: held ? 1 : 0,
+    kept: plan.kept.length,
     bytes: parts.reduce((sum, part) => sum + part.bytes, 0),
     credits: creditsOf(parts),
   };
@@ -841,7 +908,7 @@ function tidyPending(state, config, currentId) {
     const parsed = transcript && existsSync(transcript) ? readTranscript(transcript) : null;
     let done = !parsed;
     if (parsed && idleFor(transcript, config)) {
-      const content = renderTranscript(parsed, { project: pending.project, cwd: pending.cwd, branch: '' });
+      const content = renderTranscript(parsed, { project: pending.project, branch: '' });
       const hash = createHash('sha256').update(content).digest('hex');
       done = Boolean(sessions[id] && sessions[id].hash === hash);
     }
@@ -861,6 +928,7 @@ async function modeBrief(config) {
     const entry = { transcript, cwd, project: basename(cwd) };
     updateState((fresh) => { book(fresh).pending[input.session_id] = entry; }, state);
   }
+  noteConnection(config, input.session_id, state);
 
   // SessionEnd does not fire when a session is killed or the machine sleeps, so the start of the
   // next one is where an unsent session gets picked up. Only an idle one: a session still being
@@ -871,7 +939,7 @@ async function modeBrief(config) {
   for (const [id, pending] of Object.entries(book(state).pending)) {
     if (id === input.session_id || !idleFor(transcriptOf(id, pending.transcript), config)) continue;
     await ingestSession(config, state, id, pending.transcript, {
-      project: pending.project, cwd: pending.cwd, branch: '',
+      project: pending.project, branch: '',
     });
   }
 
@@ -913,12 +981,13 @@ async function modePreCompact(config) {
   const transcript = transcriptOf(input.session_id, input.transcript_path);
   if (!input.session_id || !transcript) return;
   const state = loadState();
+  noteConnection(config, input.session_id, state);
   await ingestSession(
     config,
     state,
     input.session_id,
     transcript,
-    {project: basename(cwd), cwd, branch: ''},
+    {project: basename(cwd), branch: ''},
     {stillRunning: true, compacting: true},
   );
 }
@@ -926,6 +995,7 @@ async function modePreCompact(config) {
 async function modePrompt(config) {
   const input = await readStdin();
   if (denied(config, input.cwd || '')) return;
+  noteConnection(config, input.session_id);
   const prompt = input.prompt || '';
   // A short prompt ("yes", "go on") carries no query. Spending a recall on it wastes the budget
   // and returns noise.
@@ -958,8 +1028,9 @@ function clearActivity(sessionId) { try { unlinkSync(activityPath(sessionId)); }
 // sent in sittings, and a waiter of 3 would send an open session whole. 5: sittings are cut where
 // the transcript went quiet, for as long as the config says. 6: sittings are also cut by size, and
 // a waiter of 5 would cut a session the hooks already sent by size along other lines, and send its
-// sittings again under shifted ids.
-const WAITER_VERSION = 6;
+// sittings again under shifted ids. 7: a sitting is sent with the connection it was typed under, and
+// a waiter of 6 would send what was typed before connecting, or under another key.
+const WAITER_VERSION = 7;
 // The waiter never sleeps longer than this in one go. A timer does not count the time the machine
 // is asleep, so one long timer set for "in twelve hours" fires hours late after a night with the
 // lid closed. Short slices checked against the wall clock send within a minute of waking instead.
@@ -1005,7 +1076,9 @@ function detach(...args) {
 async function modeStop(config) {
   const input = await readStdin();
   const cwd = input.cwd || '';
-  if (denied(config, cwd) || !config.ingest || !config.apiKey) return;
+  if (denied(config, cwd)) return;
+  noteConnection(config, input.session_id);
+  if (!config.ingest || !config.apiKey) return;
   const transcript = transcriptOf(input.session_id, input.transcript_path);
   if (!input.session_id || !transcript) return;
   const previous = readActivity(input.session_id) || {};
@@ -1061,7 +1134,7 @@ async function modeIdle(config, argv) {
       continue;
     }
     await ingestSession(loadConfig(), loadState(), sessionId, activity.transcript, {
-      project: basename(activity.cwd), cwd: activity.cwd, branch: '',
+      project: basename(activity.cwd), branch: '',
     }, { stillRunning: !ended });
     // A turn that landed while this was sending keeps the file, and the next Stop starts a waiter.
     const after = readActivity(sessionId);
@@ -1196,6 +1269,8 @@ function readTranscript(path) {
   let branch = '';
   let project = '';
   let cwd = '';
+  let model = '';
+  let effort = '';
   let raw = '';
   try { raw = readFileSync(path, 'utf8'); } catch { return null; }
   const silence = silenceMeter();
@@ -1229,6 +1304,12 @@ function readTranscript(path) {
     }
     if (copying && !copyEnds) copyEnds = (Date.parse(entry.timestamp) || 0) + COPY_WRITE_MS;
     if (copyEnds && !(Date.parse(entry.timestamp) > copyEnds)) continue;
+    // Before each turn Codex writes what it runs on: the model, and the reasoning effort where one
+    // is set. Each turn keeps the latest, for the sitting's metadata.
+    if (entry.type === 'turn_context') {
+      if (typeof payload.model === 'string' && payload.model) model = payload.model.slice(0, 100);
+      effort = typeof payload.effort === 'string' ? payload.effort.slice(0, 40) : '';
+    }
     // Every item of the conversation is activity, tool calls and their output included.
     if (entry.type === 'response_item') silence.seen(entry.timestamp);
     // Everything else in the file is machinery: tool calls and their output, reasoning, the copy
@@ -1249,7 +1330,7 @@ function readTranscript(path) {
     if (!text || text.trim().length < 2 || isSynthetic(text)) continue;
 
     if (!firstAt && entry.timestamp) firstAt = entry.timestamp;
-    turns.push({ role: payload.role, at: entry.timestamp || '', text: text.trim(), quiet: silence.take() });
+    turns.push({ role: payload.role, at: entry.timestamp || '', text: text.trim(), quiet: silence.take(), model, effort });
   }
 
   if (!turns.length) return null;
@@ -1293,6 +1374,9 @@ const credits = (bytes) => Math.ceil(bytes / 350);
 // Every data point is priced on its own and rounds up on its own, so sittings are summed one by one.
 const creditsOf = (parts) => parts.reduce((sum, part) => sum + credits(part.bytes), 0);
 
+// Why a sitting is not sent: it belongs to the connection it was typed under.
+const KEPT_WHY = 'they were typed before this machine was connected, or under another key';
+
 // Sending the history already on disk: every unsent session of this project, or of every project
 // with --all. One session is $past:ingest. The session this command runs in is never part of it:
 // the hooks send it when it goes idle or ends, and sending it now as well would pay for it twice.
@@ -1321,20 +1405,24 @@ async function modeBackfill(config, argv) {
   // A session the agent copied from another agent's history, with nothing said in it since, holds
   // nothing of its own. That agent's connector sends the original, with the dates it really has.
   let copies = 0;
-  const { sessions } = book(state);
+  let kept = 0;
+  const { sessions, connections } = book(state);
   for (const item of found) {
     const parsed = readTranscript(item.path);
     if (!parsed) { if (item.imported) copies++; continue; }
-    const plan = planSend(parsed, { project: basename(cwd), branch: '' }, sessions[item.sessionId], config);
-    if (!plan.changed.length) { already++; continue; }
+    const plan = planSend(parsed, { project: basename(cwd), branch: '' }, sessions[item.sessionId], config, connections[item.sessionId]);
+    kept += plan.kept.length;
+    if (!plan.changed.length) { if (!plan.kept.length) already++; continue; }
     rows.push({ item, at: parsed.firstAt, prompt: firstPrompt(parsed), parts: plan.changed });
   }
+  const keptNote = `${kept} sitting(s) stay on this machine: ${KEPT_WHY}.`;
 
   const leftOut = copies
     ? `${copies} session(s) that ${AGENT} imported from another agent are left out: the copies are dated the day of the import, and that agent's own history holds the originals.`
     : '';
   if (!rows.length) {
     console.log(`Nothing new to send. ${already} session(s) are already in past.dev.`);
+    if (kept) console.log(keptNote);
     if (leftOut) console.log(leftOut);
     return;
   }
@@ -1355,6 +1443,7 @@ async function modeBackfill(config, argv) {
       `${(bytesOf(parts) / 1024).toFixed(1)} KB of prose in ${parts.length} sitting(s), about ${creditsOf(parts).toLocaleString()} credits.`);
     console.log('Each sitting is one data point, dated at its own first turn: one ingestion toward the project\'s monthly cap.');
     if (current) console.log('The session you are in is left out: it is sent when it goes idle or ends.');
+    if (kept) console.log(keptNote);
     if (leftOut) console.log(leftOut);
     console.log('Nothing has been sent. Run the same command with --confirm to send them all, ' +
       `or ${commandOf('ingest')} <id> to send only one.`);
@@ -1366,7 +1455,7 @@ async function modeBackfill(config, argv) {
   let sittings = 0;
   for (const row of rows) {
     const result = await ingestSession(config, state, row.item.sessionId, row.item.path, {
-      project: basename(cwd), cwd, branch: '',
+      project: basename(cwd), branch: '',
     });
     if (result.ok) { sent++; sittings += result.sent; }
   }
@@ -1400,19 +1489,22 @@ async function modeIngest(config, argv) {
   const state = loadState();
   const open = target.sessionId === current || Boolean(book(state).pending[target.sessionId]);
   const result = await ingestSession(config, state, target.sessionId, target.path, {
-    project: basename(cwd), cwd, branch: '',
+    project: basename(cwd), branch: '',
   }, { stillRunning: open });
   const id = short(target.sessionId);
   if (result.skipped === 'unchanged') console.log(`Session ${id} is already in past.dev, unchanged. Nothing was sent.`);
+  else if (result.skipped === 'kept') console.log(`Nothing to send from session ${id}. ${result.kept} sitting(s) stay on this machine: ${KEPT_WHY}.`);
   else if (result.skipped) console.log(`Session ${id}: ${result.skipped}.`);
   else if (result.error) {
     console.log(`Session ${id} was not sent: ${result.error}${result.code ? ` ${result.code}` : ''}.`);
   } else {
+    const others = result.sittings - result.sent - result.kept;
     const what = result.sent === result.sittings
       ? `${result.turns} turns in ${result.sittings} sitting(s)`
-      : `${result.sent} of its ${result.sittings} sittings (the others are already in past.dev)`;
+      : `${result.sent} of its ${result.sittings} sittings` + (!others ? '' : result.kept ? ` (${others} already in past.dev)` : ' (the others are already in past.dev)');
     console.log(`Sent session ${id}: ${what}, ${(result.bytes / 1024).toFixed(1)} KB, ` +
       `about ${result.credits} credits. It appears in Memories once the pipeline finishes.`);
+    if (result.kept) console.log(`${result.kept} sitting(s) stay on this machine: ${KEPT_WHY}.`);
     if (open) console.log('It is still open: if it grows, it is sent again when it goes idle or ends.');
   }
 }
@@ -1433,18 +1525,23 @@ function modeCut(config, argv) {
       : 'Nothing to send from that transcript.');
     return;
   }
-  const { sessions, pending } = book(loadState());
-  const plan = planSend(parsed, { project: basename(cwd), branch: '' }, sessions[target.sessionId], config);
+  const { sessions, pending, connections } = book(loadState());
+  const plan = planSend(parsed, { project: basename(cwd), branch: '' }, sessions[target.sessionId], config, connections[target.sessionId]);
+  // A sitting that stays on this machine is not part of what would be sent, so it is not printed.
+  const shown = plan.sittings.filter((part) => !plan.kept.includes(part));
+  const keptNote = `${plan.kept.length} sitting(s) stay on this machine and are not shown: ${KEPT_WHY}.`;
+  if (!shown.length) { console.log(`Nothing to send from that session. ${keptNote}`); return; }
   const kb = (parts) => (parts.reduce((sum, part) => sum + part.bytes, 0) / 1024).toFixed(1);
-  const held = plan.sittings.length - plan.changed.length;
+  const held = shown.length - plan.changed.length;
   const cost = !plan.changed.length || !held
-    ? `${kb(plan.sittings)} KB sent · about ${creditsOf(plan.sittings)} credits`
-    : `${kb(plan.sittings)} KB, ${held} sitting(s) already in past.dev · ${kb(plan.changed)} KB still to send · about ${creditsOf(plan.changed)} credits`;
+    ? `${kb(shown)} KB sent · about ${creditsOf(shown)} credits`
+    : `${kb(shown)} KB, ${held} sitting(s) already in past.dev · ${kb(plan.changed)} KB still to send · about ${creditsOf(plan.changed)} credits`;
   let raw = 0;
   try { raw = statSync(target.path).size; } catch { /* size is informational */ }
-  console.error(`# session ${short(target.sessionId)} · ${parsed.turns.length} turns in ${plan.sittings.length} sitting(s) · ` +
+  const turns = shown.reduce((sum, part) => sum + part.sitting.turns.length, 0);
+  console.error(`# session ${short(target.sessionId)} · ${turns} turns in ${shown.length} sitting(s) · ` +
     `${(raw / 1024).toFixed(0)} KB on disk · ${cost}\n`);
-  console.log(plan.sittings.map((part) => part.content).join('\n'));
+  console.log(shown.map((part) => part.content).join('\n'));
 
   const id = short(target.sessionId);
   const ingest = commandOf('ingest');
@@ -1454,6 +1551,7 @@ function modeCut(config, argv) {
   else if (pending[target.sessionId]) next = `This session is still open. past.dev receives it when it goes idle or ends. To send it now: ${ingest} ${id}`;
   else next = `To send it: ${ingest} ${id}`;
   console.error(`\n# ${next}`);
+  if (plan.kept.length) console.error(`# ${keptNote}`);
 }
 
 // On-demand recall, for the skill and for a person at a terminal. The hooks cover the automatic
@@ -1603,9 +1701,15 @@ async function modeConnect(argv) {
     console.log(`Warning: ${next.apiUrl} is plain http, so the key travels unencrypted. Use https unless this network is yours.`);
   }
   if (key) {
+    // The sessions still open go on under this connection: what they hold so far stays here.
+    try {
+      const connected = loadConfig();
+      for (const id of Object.keys(book(loadState()).pending)) noteConnection(connected, id);
+    } catch { /* the next prompt's hook records it */ }
     console.log(`Connected as ${identity}. The key is in ${CONFIG_PATH}, readable only by you.`);
     console.log(`What is sent is visible to ${who}.`);
-    console.log(`New sessions are read from now on. Run ${commandOf('backfill')} to send the history already on this machine.`);
+    console.log('Sessions are read from your next prompt on: what you typed before connecting stays on this machine.');
+    console.log(`Run ${commandOf('backfill')} to send the sessions from before the plugin was installed.`);
   } else {
     console.log(`From now on, what is sent is visible to ${who}. Sessions already in past.dev keep their audience until they are sent again.`);
   }
