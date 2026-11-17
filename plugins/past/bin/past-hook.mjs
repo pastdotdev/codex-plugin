@@ -24,6 +24,9 @@ const ACTIVITY_DIR = join(HOME, 'activity', 'codex');
 // When this plugin's hooks last ran, for status: Codex runs no hook a person has not trusted, and
 // says nothing of the ones it skips.
 const STAMP_PATH = join(HOME, 'hosts', 'codex.json');
+// The watcher that sends sessions while the hooks wait for a review: its process, and when a recall
+// tool's server last saw it.
+const WATCH_PATH = join(HOME, 'hosts', 'codex-watch.json');
 const DEFAULT_IDLE_MINUTES = 720; // 12 hours
 // A session is cut into sittings where it went quiet this long. Shorter dates memories more
 // closely and makes more data points, each with less of the conversation around it; under five
@@ -42,7 +45,7 @@ const MIN_SITTING_KILOBYTES = 10;
 const COMPACTION_RESEND_MS = 60 * 60000;
 const DEFAULT_API_URL = 'https://api.past.dev';
 const MARKER = '=== past · recalled from memory ===';
-const VERSION = '0.4.1';
+const VERSION = '0.5.0';
 
 // ---------------------------------------------------------------------------------------- Codex
 
@@ -74,7 +77,8 @@ const sessionIdOf = (path) => (basename(path).match(THREAD_ID_AT_END) || [])[1] 
 // characters. The end is what tells them apart, and is what a listing prints and a person types back.
 const short = (id) => id.slice(-8);
 // Codex runs no hook a person has not trusted. This is where they do it.
-const TRUST = "trust them (/hooks in a terminal session, the past.dev plugin's page in the ChatGPT desktop app)";
+const REVIEW = "/hooks in a terminal session, the past.dev plugin's page in the ChatGPT desktop app";
+const TRUST = `trust them (${REVIEW})`;
 
 // ---------------------------------------------------------------------------- config and state
 
@@ -127,6 +131,9 @@ function loadConfig() {
       ? Math.max(MIN_SITTING_KILOBYTES, Number(file.sittingKilobytes)) : DEFAULT_SITTING_KILOBYTES,
     // An audience slug from the console; empty means the whole project sees what is sent.
     audience: typeof file.audience === 'string' ? file.audience.trim() : '',
+    // The model a session ran on, its token counts, how it is paid and whether Codex's own memory
+    // is on travel beside what is sent, so past.dev can say what it saved. `false` sends none.
+    modelUsage: file.modelUsage !== false,
   };
 }
 
@@ -468,6 +475,157 @@ function currentSession() {
   return process.env.CODEX_THREAD_ID || '';
 }
 
+// ----------------------------------------------------------- what a session ran on, and its cost
+//
+// Beside what it sends, the plugin says which model the session ran on, what the model's provider
+// counted for each sitting, how the account pays for it and whether Codex's own memory is on.
+// past.dev works out from them what it saved. None of it is part of a sitting's content, so no hash
+// moves, and `"modelUsage": false` in the config sends none of it.
+
+/** A model id as a header can carry it: nothing with a space, and nothing longer than the API takes. */
+function modelId(value) {
+  if (typeof value !== 'string') return '';
+  const id = value.trim();
+  return id && id.length <= 128 && /^[\x21-\x7e]+$/.test(id) ? id : '';
+}
+
+/**
+ * Reads what the thread's model counted. After each request Codex writes the thread's running
+ * total, so what a stretch of the thread cost is the difference between two readings, and a total
+ * written twice adds nothing. OpenAI counts the input read from its cache, and the input written to
+ * it, inside the input figure, so both are taken out of it. A reading with no reading before it, or
+ * one whose total went down, takes the last request's own figures where Codex gives them: a thread
+ * that continues another one starts from that one's total.
+ */
+function tokenMeter() {
+  const count = (value) => (Number.isFinite(value) && value > 0 ? Math.floor(value) : 0);
+  const read = (usage) => ({
+    input: count(usage.input_tokens),
+    cached: count(usage.cached_input_tokens),
+    written: count(usage.cache_write_input_tokens),
+    output: count(usage.output_tokens),
+  });
+  let last = null;
+  const replies = [];
+  return {
+    replies,
+    // `where` is the time and model of the reading, or null for one in the copy that opens a thread:
+    // it moves the total and is counted for nobody.
+    seen(info, where) {
+      const total = info && info.total_token_usage;
+      if (!total || typeof total !== 'object') return;
+      const now = read(total);
+      const restarted = !last || now.input < last.input || now.output < last.output;
+      const own = info.last_token_usage && typeof info.last_token_usage === 'object' ? read(info.last_token_usage) : now;
+      const spent = restarted ? own : {
+        input: now.input - last.input,
+        cached: Math.max(0, now.cached - last.cached),
+        written: Math.max(0, now.written - last.written),
+        output: now.output - last.output,
+      };
+      last = now;
+      const model = where ? modelId(where.model) : '';
+      if (!model || spent.input + spent.output <= 0) return;
+      replies.push({
+        at: where.at || '',
+        model,
+        input: Math.max(0, spent.input - spent.cached - spent.written),
+        cached: spent.cached,
+        written: spent.written,
+        output: spent.output,
+      });
+    },
+  };
+}
+
+/**
+ * Each sitting's token counts by model: every reading written from the sitting's first turn until
+ * the next sitting's. A reading from before the first turn counts with the first sitting.
+ */
+function sittingTokens(sittings, replies) {
+  const starts = sittings.map((sitting) => Date.parse(sitting.firstAt));
+  const totals = sittings.map(() => ({}));
+  if (!sittings.length) return totals;
+  for (const reply of replies) {
+    const at = Date.parse(reply.at);
+    let index = 0;
+    for (let i = 1; i < starts.length; i++) if (starts[i] <= at) index = i;
+    const counts = totals[index][reply.model] || { input: 0, cached_input: 0, cache_write: 0, output: 0 };
+    counts.input += reply.input;
+    counts.cached_input += reply.cached;
+    counts.cache_write += reply.written;
+    counts.output += reply.output;
+    totals[index][reply.model] = counts;
+  }
+  return totals;
+}
+
+const tokensIn = (counts) => counts.input + counts.cached_input + counts.cache_write + counts.output;
+
+/** The `agent` object of an ingest item: the sitting's counts for each model, or nothing where it has none. */
+function agentOf(totals) {
+  const models = Object.entries(totals || {})
+    .filter(([, counts]) => tokensIn(counts) > 0)
+    .sort((x, y) => tokensIn(y[1]) - tokensIn(x[1]))
+    .slice(0, 16);
+  if (!models.length) return undefined;
+  const tokens = {};
+  for (const [model, counts] of models) tokens[model] = counts;
+  return { tokens };
+}
+
+// The modes Codex runs as hooks.
+const HOOK_MODES = ['brief', 'prompt', 'stop', 'precompact', 'end'];
+
+/**
+ * How the account pays for its model: by the token with an API key, or with a subscription. Read
+ * from whether a variable is set, never from its value, and never from the file that holds Codex's
+ * sign-in. A hook reads its own environment and stamps the answer; the tool, a skill's command and
+ * the detached processes say what the last hook saw, since Codex hands them a shorter environment.
+ */
+function billingOf() {
+  const stamped = (readJson(STAMP_PATH, null) || {}).billing;
+  if (!HOOK_MODES.includes(mode) && (stamped === 'api' || stamped === 'subscription')) return stamped;
+  return process.env.OPENAI_API_KEY || process.env.CODEX_API_KEY ? 'api' : 'subscription';
+}
+
+/**
+ * Whether Codex's own memory is on: `memories` under `[features]` in its config, which is off
+ * unless set, and `use_memories` under `[memories]`, which can keep it from being read.
+ */
+function ownMemoryOf() {
+  let text = '';
+  try { text = readFileSync(join(codexHome(), 'config.toml'), 'utf8'); } catch { return 'off'; }
+  let table = '';
+  let feature = false;
+  let used = true;
+  for (const raw of text.split('\n')) {
+    const line = raw.replace(/#.*$/, '').trim();
+    const header = line.match(/^\[([^\[\]]+)\]$/);
+    if (header) { table = header[1].trim(); continue; }
+    const pair = line.match(/^([A-Za-z0-9_."-]+)\s*=\s*(true|false)$/);
+    if (!pair) continue;
+    const key = (table ? `${table}.` : '') + pair[1].replace(/"/g, '');
+    if (key === 'features.memories') feature = pair[2] === 'true';
+    if (key === 'memories.use_memories') used = pair[2] === 'true';
+  }
+  return feature && used ? 'on' : 'off';
+}
+
+/** The headers that go beside a recall or a send: the model where one is known, and the two facts above. */
+function originOf(config, model) {
+  if (!config.modelUsage) return {};
+  const headers = { 'X-Past-Model-Billing': billingOf(), 'X-Past-Agent-Memory': ownMemoryOf() };
+  const id = modelId(model);
+  if (id) headers['X-Past-Model'] = id;
+  return headers;
+}
+
+/** The model the last hook ran under: what a call made outside a hook, the tool's or a skill's, says it runs on. */
+function stampedModel() {
+  return modelId((readJson(STAMP_PATH, null) || {}).model);
+}
+
 // ------------------------------------------------------------------------------ the memory API
 
 // Codex runs the commands its model issues inside a sandbox: no network unless the person allowed
@@ -548,7 +706,7 @@ async function checkCredits(config, operation, timeoutMs, force = false) {
   return !creditPause(config, operation);
 }
 
-async function api(config, path, body, timeoutMs, method = 'POST') {
+async function api(config, path, body, timeoutMs, method = 'POST', origin = {}) {
   if (!config.apiKey) return null;
   const operation = method === 'POST' && ['/api/v1/ingest', '/api/v1/ingest/batch'].includes(path) ? 'ingest'
     : method === 'POST' && path === '/api/v1/recall' ? 'recall' : null;
@@ -565,6 +723,7 @@ async function api(config, path, body, timeoutMs, method = 'POST') {
         'Authorization': `Bearer ${config.apiKey}`,
         'Content-Type': 'application/json',
         'User-Agent': `past-${SOURCE}/${VERSION}`,
+        ...origin,
       },
       body: body === null ? undefined : JSON.stringify(body),
       signal: control.signal,
@@ -594,7 +753,7 @@ async function api(config, path, body, timeoutMs, method = 'POST') {
   }
 }
 
-async function recall(config, query, limit, timeoutMs) {
+async function recall(config, query, limit, timeoutMs, origin) {
   if (!config.recall || !config.identity || !query) return [];
   const result = await api(config, '/api/v1/recall', {
     // A query leaves the machine exactly as the content does, so it is redacted exactly as the
@@ -603,7 +762,7 @@ async function recall(config, query, limit, timeoutMs) {
     identity: config.identity,
     limit,
     level: 'low',
-  }, timeoutMs);
+  }, timeoutMs, 'POST', origin);
   if (!result || result.error || !Array.isArray(result.results)) return [];
   // One result per document, already in rank order; its artifact and sources are context the
   // brief does not print.
@@ -709,10 +868,27 @@ async function recallTool(args) {
     identity: config.identity,
     limit: TOOL_LIMIT,
     maxTokens: TOOL_MAX_TOKENS,
-  }, TOOL_TIMEOUT_MS);
+  }, TOOL_TIMEOUT_MS, 'POST', originOf(config, stampedModel()));
   if (!page) return { text: 'past.dev did not answer. Try again in a moment.', isError: true };
   if (page.error) return { text: `past.dev refused the recall (${page.error}).`, isError: true };
   return { text: renderPage(page) || 'Nothing in past.dev matches that yet.', isError: false };
+}
+
+/**
+ * What the tool says first while the hooks do not run. A hook cannot say that it was skipped, and
+ * Codex says so on a screen only, so the tool's answer is where the model, and through it the
+ * person, learns why nothing is recalled before a prompt.
+ */
+function hooksNotice(config) {
+  const hooks = hookState();
+  if (hooks.state === 'running') return '';
+  if (hooks.state === 'never') {
+    return `[past.dev] Tell the person once: the past.dev hooks have never run in ${AGENT}, so nothing is recalled ` +
+      `before a prompt and no session is saved. To turn them on, the person reviews the hooks: ${REVIEW}.`;
+  }
+  return `[past.dev] Tell the person once: ${AGENT} updated the past.dev plugin and set its hooks aside until they ` +
+    `are reviewed again, so nothing is recalled before a prompt. To turn that back on, the person reviews the hooks: ${REVIEW}.` +
+    (config.ingest && config.apiKey ? ' Sessions are still saved to past.dev meanwhile, each once it has gone quiet.' : '');
 }
 
 /** A small MCP server over stdio: one JSON-RPC message per line, the one tool above. */
@@ -736,7 +912,11 @@ function modeMcp() {
           capabilities: { tools: {} },
           serverInfo: { name: 'past', title: 'past.dev', version: VERSION },
           instructions: `past_recall searches this project's memory in past.dev. The block headed "${MARKER}" before a ` +
-            'prompt already holds what was recalled for it; call past_recall for anything the request depends on that the block does not hold.',
+            'prompt already holds what was recalled for it; call past_recall for anything the request depends on that the block does not hold.' +
+            // Read when the server starts, which can be before the person reviews the hooks: so it
+            // is said of a conversation that holds no such block, and the tool's answer says the rest.
+            (hookState().state === 'running' ? '' : ' Where no such block comes before a prompt, the plugin\'s hooks are not running: ' +
+              'call past_recall yourself for what the request depends on, and pass on what its answer says about the hooks.'),
         } });
       } else if (method === 'ping') {
         if (answers) send({ id, result: {} });
@@ -748,7 +928,10 @@ function modeMcp() {
           return;
         }
         const { text, isError } = await recallTool(params.arguments);
-        send({ id, result: { content: [{ type: 'text', text }], isError } });
+        // Read at the call: a prompt's hook runs before the model can call the tool, so hooks that
+        // had run on this version would have stamped it by now.
+        const notice = hooksNotice(loadConfig());
+        send({ id, result: { content: [{ type: 'text', text: notice ? `${notice}\n\n${text}` : text }], isError } });
       } else if (answers) {
         send({ id, error: { code: -32601, message: `Method not found: ${method}` } });
       }
@@ -761,6 +944,11 @@ function modeMcp() {
     inflight.add(work);
     work.then(() => inflight.delete(work));
   });
+  // Codex starts this server whether or not it runs the hooks, so it is what keeps the watcher
+  // going while they wait. The first look leaves a session's first hook the time to run.
+  const tend = () => { try { tendWatcher(); } catch { /* the tool still answers */ } };
+  setTimeout(tend, WATCH_FIRST_MS).unref();
+  setInterval(tend, WAITER_SLICE_MS).unref();
   return new Promise((done) => lines.on('close', () => Promise.all([...inflight]).then(done)));
 }
 
@@ -795,6 +983,10 @@ async function ingestSession(config, state, sessionId, transcriptPath, context, 
   }
 
   const place = placeOf(parsed, context);
+  // Beside each sitting, what its requests cost by model; beside the call, the model the session
+  // last ran on. Neither is in a sitting's content.
+  const counted = config.modelUsage ? sittingTokens(plan.sittings.map((part) => part.sitting), parsed.replies) : [];
+  const origin = originOf(config, parsed.turns[parsed.turns.length - 1].model);
   // One call for every sitting that changed, so a session spends one request however long it ran.
   // Each sitting is labelled with its own branch, the one its content is rendered with.
   const result = await api(config, '/api/v1/ingest/batch', {
@@ -818,9 +1010,10 @@ async function ingestSession(config, state, sessionId, transcriptPath, context, 
           turns: part.sitting.turns.length,
           ...ranOn(part.sitting),
         },
+        agent: agentOf(counted[part.index]),
       };
     }),
-  }, 30000);
+  }, 30000, 'POST', origin);
 
   if (!result || result.error) {
     // Hooks stay silent by design, so the failure is kept for $past:status to report.
@@ -929,6 +1122,7 @@ async function modeBrief(config) {
     updateState((fresh) => { book(fresh).pending[input.session_id] = entry; }, state);
   }
   noteConnection(config, input.session_id, state);
+  stampModel(input.model);
 
   // SessionEnd does not fire when a session is killed or the machine sleeps, so the start of the
   // next one is where an unsent session gets picked up. Only an idle one: a session still being
@@ -936,6 +1130,7 @@ async function modeBrief(config) {
   // now as well would pay for it twice.
   updateState((fresh) => tidyPending(fresh, config, input.session_id), state);
   ensureWaiters();
+  if (countsDue(state, config)) detach('counts');
   for (const [id, pending] of Object.entries(book(state).pending)) {
     if (id === input.session_id || !idleFor(transcriptOf(id, pending.transcript), config)) continue;
     await ingestSession(config, state, id, pending.transcript, {
@@ -950,7 +1145,7 @@ async function modeBrief(config) {
   const project = `${basename(cwd)} recent decisions and context`;
   const query = source === 'compact' ? recentPrompts(transcript) || project : project;
 
-  const memories = await recall(config, query, 6, 8000);
+  const memories = await recall(config, query, 6, 8000, originOf(config, input.model));
   emit('SessionStart', renderRecall(memories, 2200));
 }
 
@@ -996,11 +1191,12 @@ async function modePrompt(config) {
   const input = await readStdin();
   if (denied(config, input.cwd || '')) return;
   noteConnection(config, input.session_id);
+  stampModel(input.model);
   const prompt = input.prompt || '';
   // A short prompt ("yes", "go on") carries no query. Spending a recall on it wastes the budget
   // and returns noise.
   if (prompt.trim().length < 12 || isSynthetic(prompt)) return;
-  const memories = await recall(config, prompt, 10, 4000);
+  const memories = await recall(config, prompt, 10, 4000, originOf(config, input.model));
   emit('UserPromptSubmit', renderRecall(memories, 4000));
 }
 
@@ -1029,8 +1225,9 @@ function clearActivity(sessionId) { try { unlinkSync(activityPath(sessionId)); }
 // the transcript went quiet, for as long as the config says. 6: sittings are also cut by size, and
 // a waiter of 5 would cut a session the hooks already sent by size along other lines, and send its
 // sittings again under shifted ids. 7: a sitting is sent with the connection it was typed under, and
-// a waiter of 6 would send what was typed before connecting, or under another key.
-const WAITER_VERSION = 7;
+// a waiter of 6 would send what was typed before connecting, or under another key. 8: a sitting goes
+// with its token counts, and one a waiter of 7 sent would be in past.dev without them.
+const WAITER_VERSION = 8;
 // The waiter never sleeps longer than this in one go. A timer does not count the time the machine
 // is asleep, so one long timer set for "in twelve hours" fires hours late after a night with the
 // lid closed. Short slices checked against the wall clock send within a minute of waking instead.
@@ -1157,6 +1354,252 @@ async function modeEnd(config) {
   ensureWaiters();
 }
 
+// ------------------------------------------------------------ while the hooks wait for a review
+//
+// Codex keeps a person's approval of a plugin's hooks against the plugin's files, so an update of
+// this plugin sets its hooks aside until the person reviews them again, and Codex installs an
+// update by itself. Until then no hook runs: nothing is recalled before a prompt, no session is
+// noted as open, and no waiter is started. Codex says so where it has a screen and nowhere else.
+//
+// Codex still starts the recall tool's server, so the plugin carries on from there, for a person
+// who had approved the hooks before. The tool's answer says the hooks wait and where to review
+// them. And the server keeps one watcher on the machine, which reads the threads written since the
+// hooks last ran and sends each once it has been quiet for its sitting length: every sitting it
+// holds is closed by then, since the next turn starts a new one, so nothing the watcher sent is
+// ever sent again. Hooks that never ran were never approved, and nothing is sent in their place.
+
+// Bumped whenever the watcher's logic changes, as the waiter's is: an older one is replaced.
+const WATCH_VERSION = 1;
+// The recall tool's server looks for the first time this long after it starts, which leaves the
+// first hook of a session the time to run and stamp this version.
+const WATCH_FIRST_MS = 3000;
+// A server notes that it lives every minute. Past this, none is left: Codex is gone.
+const WATCH_GONE_MS = 3 * 60000;
+// A send that failed is tried again after this long, doubled at each failure, up to six hours.
+const WATCH_RETRY_MS = 5 * 60000;
+
+/** Whether version `a` is older than `b`, read as dotted numbers. One that cannot be read is the oldest. */
+function olderThan(a, b) {
+  const parts = (text) => String(text || '').split('.').map((part) => parseInt(part, 10) || 0);
+  const x = parts(a);
+  const y = parts(b);
+  for (let i = 0; i < 3; i++) {
+    if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) < (y[i] || 0);
+  }
+  return false;
+}
+
+/**
+ * Whether Codex runs this plugin's hooks, read from their stamp: `never` where none has run on this
+ * machine, `waiting` where the last one ran on an older version than this script's, which is what
+ * an update leaves until the person reviews the hooks again, and `running` otherwise. A stamp from
+ * a newer version is a newer copy of the plugin at work beside this one. `since` is when a hook
+ * last ran.
+ */
+function hookState() {
+  const stamp = readJson(STAMP_PATH, null);
+  const since = stamp && typeof stamp === 'object' ? Date.parse(stamp.lastHookAt) : NaN;
+  if (Number.isNaN(since)) return { state: 'never' };
+  return { state: olderThan(stamp.version, VERSION) ? 'waiting' : 'running', since, version: stamp.version || '' };
+}
+
+/** When a session still open reaches past.dev, for what a command prints. */
+function sendsWhen(config) {
+  return hookState().state === 'waiting'
+    ? `once it has been quiet for ${config.sittingMinutes} min`
+    : 'when it goes idle or ends';
+}
+
+/**
+ * Keeps one live watcher of the current version while the hooks wait, and notes that a recall
+ * tool's server is alive, which is how the watcher knows that Codex still runs. A watcher that a
+ * newer copy of the plugin started is left alone.
+ */
+function tendWatcher() {
+  if (SANDBOXED || hookState().state !== 'waiting') return;
+  const watch = readJson(WATCH_PATH, null) || {};
+  const now = Date.now();
+  let { pid, startedAt } = watch;
+  if (!isAlive(pid) || !(watch.version >= WATCH_VERSION)) {
+    if (isAlive(pid)) { try { process.kill(pid); } catch { /* already gone */ } }
+    pid = detach('watch');
+    startedAt = now;
+  }
+  privateDir(join(HOME, 'hosts'));
+  writePrivate(WATCH_PATH, JSON.stringify({ pid, version: WATCH_VERSION, startedAt, seenAt: now }) + '\n');
+}
+
+/**
+ * The threads written since the hooks last ran that the watcher has not dealt with as they are now:
+ * `watched` in the state holds, per thread, the time of the file as it was last dealt with. A
+ * subagent's thread and one in an ignored folder are left out, as the hooks leave them out. With
+ * `every`, the ones already dealt with are listed too.
+ */
+function unwatched(config, since, state, metas, every = false) {
+  const done = every ? {} : book(state).watched || {};
+  const found = [];
+  for (const path of codexTranscriptPaths()) {
+    let mtime = 0;
+    try { mtime = statSync(path).mtimeMs; } catch { continue; }
+    if (!(mtime > since)) continue;
+    const sessionId = sessionIdOf(path);
+    if (done[sessionId] === mtime) continue;
+    // A thread's first line is read once: where it was started, and what started it.
+    if (!metas.has(path)) metas.set(path, codexMeta(path));
+    const meta = metas.get(path);
+    if (isSubagentSource(meta.source) || denied(config, meta.cwd || '')) continue;
+    found.push({ sessionId, path, mtime, cwd: meta.cwd || '' });
+  }
+  return found;
+}
+
+/**
+ * The watcher: one detached process for the machine. Every minute, while the hooks wait, it takes
+ * up the threads written since they last ran, records the connection each is typed under, as a hook
+ * would (rule 14 holds without one), and sends a thread once nothing was written to it for its
+ * sitting length. It leaves when the hooks run again or Codex is gone, once every thread it took up
+ * is in past.dev: a thread it leaves behind is on the open list, where the next session start finds it.
+ */
+async function modeWatch() {
+  const tracked = new Map(); // thread id → where it is, and when a failed send is tried again
+  const metas = new Map();
+  for (let round = 0; ; round++) {
+    // The first wait gives the server that started this watcher the moment it needs to record it.
+    await new Promise((resolve) => setTimeout(resolve, round ? WAITER_SLICE_MS : 500));
+    const watch = readJson(WATCH_PATH, null);
+    // Another pid: a newer watcher has the machine.
+    if (watch && watch.pid && watch.pid !== process.pid) return;
+    const current = loadConfig();
+    const hooks = hookState();
+    const state = loadState();
+    const sending = Boolean(current.ingest && current.apiKey);
+
+    if (hooks.state === 'waiting') {
+      if (!round) {
+        // What was dealt with before the hooks last ran is theirs again, and is forgotten here.
+        updateState((fresh) => {
+          const done = book(fresh).watched;
+          for (const id of Object.keys(done || {})) if (!(done[id] > hooks.since)) delete done[id];
+          tidyPending(fresh, current, '');
+        }, state);
+      }
+      for (const found of unwatched(current, hooks.since, state, metas)) {
+        if (!tracked.has(found.sessionId)) tracked.set(found.sessionId, { path: found.path, cwd: found.cwd, fails: 0, retryAt: 0 });
+      }
+    }
+
+    let left = 0;
+    for (const [sessionId, thread] of tracked) {
+      // The connection in force now holds from here on; the first record covers the thread's start.
+      noteConnection(current, sessionId, state);
+      if (!sending) continue;
+      let mtime = 0;
+      // Codex moves an archived thread's file: it is found again where it went, at the next look.
+      try { mtime = statSync(thread.path).mtimeMs; } catch { tracked.delete(sessionId); continue; }
+      if (!book(state).pending[sessionId]) {
+        const entry = { transcript: thread.path, cwd: thread.cwd, project: basename(thread.cwd) };
+        updateState((fresh) => { book(fresh).pending[sessionId] = entry; }, state);
+      }
+      // A session keeps the sitting length it was first sent with, and is quiet by that one.
+      const sent = book(state).sessions[sessionId];
+      const minutes = sent && sent.sittingMinutes ? sent.sittingMinutes : current.sittingMinutes;
+      if (Date.now() - mtime < minutes * 60000 || Date.now() < thread.retryAt) { left++; continue; }
+      const result = await ingestSession(current, state, sessionId, thread.path, {
+        project: basename(thread.cwd), branch: '',
+      }, { stillRunning: true });
+      if (result.error) {
+        thread.fails++;
+        thread.retryAt = Date.now() + Math.min(6 * 60 * 60000, WATCH_RETRY_MS * Math.pow(2, thread.fails - 1));
+        left++;
+        continue;
+      }
+      // Sent, or nothing of it to send: dealt with as it is now. A turn written since moves the
+      // file's time, and the thread is taken up again.
+      updateState((fresh) => {
+        const own = book(fresh);
+        if (!own.watched) own.watched = {};
+        own.watched[sessionId] = mtime;
+      }, state);
+      tracked.delete(sessionId);
+    }
+
+    const gone = !watch || Date.now() - (watch.seenAt || 0) > WATCH_GONE_MS;
+    if ((hooks.state !== 'waiting' || gone) && !left) return;
+  }
+}
+
+// ---------------------------------------------------- the counts of the sittings already sent
+//
+// A sitting sent before the plugin counted tokens is in past.dev without its counts, and it is never
+// sent again while it does not change. So once, after the update, the plugin sends the counts alone
+// for every sitting already in past.dev whose transcript is still on this machine: ids and numbers,
+// no content. past.dev keeps them for the data points it holds and ignores the others, so nothing
+// is made, moved or charged. It runs in a process of its own, started at a session's start.
+
+const COUNTS_RETRY_MS = 24 * 60 * 60000;
+const COUNTS_BATCH = 500;
+
+function countsDue(state, config) {
+  if (!config.modelUsage || !config.ingest || !config.apiKey) return false;
+  const counts = book(state).counts;
+  if (!counts) return true;
+  return !counts.doneAt && Date.now() - (counts.triedAt || 0) >= COUNTS_RETRY_MS;
+}
+
+async function modeCounts(config) {
+  // One process at a time, and one try a day until it is done.
+  let claimed = false;
+  updateState((fresh) => {
+    if (!countsDue(fresh, config)) return;
+    book(fresh).counts = { triedAt: Date.now() };
+    claimed = true;
+  });
+  if (!claimed) return;
+  const origin = originOf(config, '');
+  // Asked with nothing first: a deployment from before the route existed answers 404, and reading
+  // every transcript for it would be work for nothing.
+  const probe = await api(config, '/api/v1/agent-tokens', { items: [] }, 15000, 'PUT', origin);
+  if (!probe || probe.error) return;
+
+  const { sessions, connections } = book(loadState());
+  const connection = connectionOf(config);
+  let items = [];
+  let sent = 0;
+  const flush = async () => {
+    if (!items.length) return true;
+    const result = await api(config, '/api/v1/agent-tokens', { items }, 30000, 'PUT', origin);
+    if (!result || result.error) return false;
+    sent += items.length;
+    items = [];
+    return true;
+  };
+  for (const found of listTranscripts(true, '')) {
+    const before = sessions[found.sessionId];
+    if (!before) continue;
+    const parsed = readTranscript(found.path);
+    if (!parsed) continue;
+    // Cut as it was sent: a session sent whole is one data point, the others keep their pinned cut.
+    const whole = !Array.isArray(before.sittings);
+    const pinned = Boolean(before.sittingMinutes);
+    const sittings = whole ? [parsed] : sittingsOf(parsed,
+      pinned ? before.sittingMinutes : config.sittingMinutes,
+      pinned ? (Number(before.sittingKilobytes) || 0) : config.sittingKilobytes,
+      connections[found.sessionId]);
+    const counted = sittingTokens(sittings, parsed.replies);
+    for (const [index, sitting] of sittings.entries()) {
+      // A sitting that was never sent has no data point, and one typed under another connection is
+      // not this connection's to speak of.
+      if (!whole && typeof before.sittings[index] !== 'string') continue;
+      if (!whole && sitting.connection !== undefined && !(connection !== '' && sitting.connection === connection)) continue;
+      const agent = agentOf(counted[index]);
+      if (agent) items.push({ id: sittingId(found.sessionId, index), agent });
+    }
+    if (items.length >= COUNTS_BATCH && !await flush()) return;
+  }
+  if (!await flush()) return;
+  updateState((fresh) => { book(fresh).counts = { doneAt: new Date().toISOString(), sittings: sent }; });
+}
+
 // ---------------------------------------------------------------------------- Codex transcripts
 
 function codexHome() { return process.env.CODEX_HOME || join(homedir(), '.codex'); }
@@ -1274,6 +1717,7 @@ function readTranscript(path) {
   let raw = '';
   try { raw = readFileSync(path, 'utf8'); } catch { return null; }
   const silence = silenceMeter();
+  const tokens = tokenMeter();
 
   // Some threads open with a copy of another conversation, dated the day the copy was made: a
   // thread Codex imported from another agent, and a fork of a thread Codex keeps whole (a legacy
@@ -1303,7 +1747,14 @@ function readTranscript(path) {
       continue;
     }
     if (copying && !copyEnds) copyEnds = (Date.parse(entry.timestamp) || 0) + COPY_WRITE_MS;
-    if (copyEnds && !(Date.parse(entry.timestamp) > copyEnds)) continue;
+    const copied = Boolean(copyEnds) && !(Date.parse(entry.timestamp) > copyEnds);
+    // What the model counted so far. A reading in the copy is the other conversation's: it sets
+    // where this thread's own counting starts.
+    if (entry.type === 'event_msg' && payload.type === 'token_count') {
+      tokens.seen(payload.info, copied ? null : { at: entry.timestamp, model });
+      continue;
+    }
+    if (copied) continue;
     // Before each turn Codex writes what it runs on: the model, and the reasoning effort where one
     // is set. Each turn keeps the latest, for the sitting's metadata.
     if (entry.type === 'turn_context') {
@@ -1334,7 +1785,7 @@ function readTranscript(path) {
   }
 
   if (!turns.length) return null;
-  return { turns, firstAt: firstAt || new Date().toISOString(), branch, project, cwd };
+  return { turns, firstAt: firstAt || new Date().toISOString(), branch, project, cwd, replies: tokens.replies };
 }
 
 /**
@@ -1442,7 +1893,7 @@ async function modeBackfill(config, argv) {
     console.log(`${rows.length} session(s) to send${already ? `, ${already} already sent` : ''}: ` +
       `${(bytesOf(parts) / 1024).toFixed(1)} KB of prose in ${parts.length} sitting(s), about ${creditsOf(parts).toLocaleString()} credits.`);
     console.log('Each sitting is one data point, dated at its own first turn: one ingestion toward the project\'s monthly cap.');
-    if (current) console.log('The session you are in is left out: it is sent when it goes idle or ends.');
+    if (current) console.log(`The session you are in is left out: it is sent ${sendsWhen(config)}.`);
     if (kept) console.log(keptNote);
     if (leftOut) console.log(leftOut);
     console.log('Nothing has been sent. Run the same command with --confirm to send them all, ' +
@@ -1505,7 +1956,7 @@ async function modeIngest(config, argv) {
     console.log(`Sent session ${id}: ${what}, ${(result.bytes / 1024).toFixed(1)} KB, ` +
       `about ${result.credits} credits. It appears in Memories once the pipeline finishes.`);
     if (result.kept) console.log(`${result.kept} sitting(s) stay on this machine: ${KEPT_WHY}.`);
-    if (open) console.log('It is still open: if it grows, it is sent again when it goes idle or ends.');
+    if (open) console.log(`It is still open: if it grows, it is sent again ${sendsWhen(config)}.`);
   }
 }
 
@@ -1547,11 +1998,20 @@ function modeCut(config, argv) {
   const ingest = commandOf('ingest');
   let next;
   if (!plan.changed.length) next = 'Already in past.dev, unchanged.';
-  else if (target.sessionId === current) next = `This is the session you are in. past.dev receives it when it goes idle or ends. To send it now: ${ingest}`;
-  else if (pending[target.sessionId]) next = `This session is still open. past.dev receives it when it goes idle or ends. To send it now: ${ingest} ${id}`;
+  else if (target.sessionId === current) next = `This is the session you are in. past.dev receives it ${sendsWhen(config)}. To send it now: ${ingest}`;
+  else if (pending[target.sessionId]) next = `This session is still open. past.dev receives it ${sendsWhen(config)}. To send it now: ${ingest} ${id}`;
   else next = `To send it: ${ingest} ${id}`;
   console.error(`\n# ${next}`);
   if (plan.kept.length) console.error(`# ${keptNote}`);
+  // What travels beside the text is said here too: this is where a person reads what leaves.
+  if (config.modelUsage) {
+    const counted = sittingTokens(plan.sittings.map((part) => part.sitting), parsed.replies);
+    const total = shown.reduce((sum, part) => sum + Object.values(counted[part.index]).reduce((all, counts) => all + tokensIn(counts), 0), 0);
+    const models = [...new Set(shown.reduce((all, part) => all.concat(Object.keys(counted[part.index])), []))];
+    console.error(`# Beside the text: the model${models.length ? ` (${models.join(', ')})` : ''}, its token counts ` +
+      `(${total.toLocaleString()} in all), how it is paid (${billingOf()}) and whether ${AGENT}'s own memory is on ` +
+      `(${ownMemoryOf()}). "modelUsage": false in ${CONFIG_PATH} sends none of it.`);
+  }
 }
 
 // On-demand recall, for the skill and for a person at a terminal. The hooks cover the automatic
@@ -1562,7 +2022,7 @@ async function modeSearch(config, argv) {
   if (!config.apiKey) { console.log(`Not connected. Run ${commandOf('connect')} first.`); return; }
   if (!config.identity) { console.log(`No identity set. Run ${commandOf('connect')} to set one.`); return; }
   if (OFFLINE) { console.log(NEEDS_OUTSIDE); return; }
-  const memories = await recall(config, query, 8, 15000);
+  const memories = await recall(config, query, 8, 15000, originOf(config, stampedModel()));
   if (creditPause(config, 'recall')) { console.log(`Recall paused: insufficient credits. Run ${commandOf('status')} --refresh after you add credits.`); return; }
   if (!memories.length) { console.log('Nothing in past.dev matches that yet.'); return; }
   for (const [index, memory] of memories.entries()) {
@@ -1594,6 +2054,10 @@ async function modeStatus(config, argv) {
       '(sittingMinutes, sittingKilobytes; a session keeps the values it was first sent with)',
     `Sessions   ${sent} sent · ${open.length} open` +
       (unsent ? ` (${unsent} not sent yet)` : ''),
+    `Model use  ${config.modelUsage
+      ? `sent beside each sitting and recall: the model, its token counts, how it is paid (${billingOf()}), ` +
+        `${AGENT}'s own memory (${ownMemoryOf()})`
+      : 'not sent'} ("modelUsage" in the config)`,
   ];
   const watched = (existsSync(ACTIVITY_DIR) ? readdirSync(ACTIVITY_DIR) : [])
     .map((file) => readJson(join(ACTIVITY_DIR, file), null))
@@ -1625,11 +2089,20 @@ async function modeStatus(config, argv) {
       `${lastError.status}${lastError.code ? ` ${lastError.code}` : ''}` +
       (lastError.code === 'audience-unknown' ? ` — the audience no longer exists; run ${commandOf('connect')} --audience <slug | project>` : ''));
   }
-  const stamp = readJson(STAMP_PATH, null);
-  const ran = stamp && stamp.lastHookAt ? new Date(stamp.lastHookAt) : null;
-  lines.push(ran
-    ? `Hooks      last ran ${ran.toDateString().slice(4, 10)} ${ran.toTimeString().slice(0, 5)}`
-    : `Hooks      have never run in ${AGENT}: ${TRUST}, then send a prompt`);
+  const hooks = hookState();
+  const ran = hooks.state === 'never' ? null : new Date(hooks.since);
+  const lastRan = ran ? `${ran.toDateString().slice(4, 10)} ${ran.toTimeString().slice(0, 5)}` : '';
+  if (hooks.state === 'waiting') {
+    // An update sets the hooks aside until they are reviewed again, and only a screen says so.
+    lines.push(`Hooks      waiting for your review since ${AGENT} updated the plugin to ${VERSION} ` +
+      `(they last ran ${lastRan}${hooks.version ? `, on ${hooks.version}` : ''}): ${TRUST}`);
+    lines.push('           until then nothing is recalled before a prompt; past_recall still answers' +
+      (config.ingest && config.apiKey ? `, and each session is sent once it has been quiet for ${config.sittingMinutes} min` : ''));
+  } else {
+    lines.push(ran
+      ? `Hooks      last ran ${lastRan}`
+      : `Hooks      have never run in ${AGENT}: ${TRUST}, then send a prompt`);
+  }
   if (config.deny.length) lines.push(`Ignored    ${config.deny.join(', ')}`);
   console.log(lines.join('\n'));
 }
@@ -1691,6 +2164,21 @@ async function modeConnect(argv) {
       if (found === null) audienceNote = ` (not checked: the API did not answer; ${commandOf('status')} reports it if a send is refused)`;
     }
   }
+  // While the hooks wait, no hook records a thread's connection, and the watcher looks once a minute.
+  // So the threads written since the hooks last ran are recorded here: under the connection in
+  // force until now for what they hold so far, and under the new one below, from this moment on.
+  let waiting = [];
+  if (key) {
+    try {
+      const hooks = hookState();
+      if (hooks.state === 'waiting') {
+        const before = loadConfig();
+        const state = loadState();
+        waiting = unwatched(before, hooks.since, state, new Map(), true);
+        for (const found of waiting) noteConnection(before, found.sessionId, state);
+      }
+    } catch { /* the watcher records it at its next look */ }
+  }
   try { saveConfig(next); } catch (error) {
     console.log(SANDBOXED ? NEEDS_OUTSIDE : `Could not write ${CONFIG_PATH}: ${error.code || error.message}.`);
     return;
@@ -1705,6 +2193,7 @@ async function modeConnect(argv) {
     try {
       const connected = loadConfig();
       for (const id of Object.keys(book(loadState()).pending)) noteConnection(connected, id);
+      for (const found of waiting) noteConnection(connected, found.sessionId);
     } catch { /* the next prompt's hook records it */ }
     console.log(`Connected as ${identity}. The key is in ${CONFIG_PATH}, readable only by you.`);
     console.log(`What is sent is visible to ${who}.`);
@@ -1722,9 +2211,22 @@ async function modeConnect(argv) {
 function stampHook() {
   try {
     privateDir(join(HOME, 'hosts'));
-    writePrivate(STAMP_PATH,
-      JSON.stringify({ lastHookAt: new Date().toISOString(), version: VERSION, node: process.version }) + '\n');
+    const stamp = { lastHookAt: new Date().toISOString(), version: VERSION, node: process.version, billing: billingOf() };
+    // The model a hook last named stays until another hook names one.
+    const model = stampedModel();
+    if (model) stamp.model = model;
+    writePrivate(STAMP_PATH, JSON.stringify(stamp) + '\n');
   } catch { /* a stamp is never worth a failed hook */ }
+}
+
+/** Keeps the model Codex names in a hook's input, for the calls made outside a hook. */
+function stampModel(model) {
+  const id = modelId(model);
+  if (!id || id === stampedModel()) return;
+  try {
+    const stamp = readJson(STAMP_PATH, null) || {};
+    writePrivate(STAMP_PATH, JSON.stringify({ ...stamp, model: id }) + '\n');
+  } catch { /* the next hook names it again */ }
 }
 
 // ------------------------------------------------------------------------------------ dispatch
@@ -1742,13 +2244,15 @@ const [mode, ...argv] = args;
 const config = loadConfig();
 
 try {
-  if (['brief', 'prompt', 'stop', 'precompact', 'end'].includes(mode)) stampHook();
+  if (HOOK_MODES.includes(mode)) stampHook();
   if (mode === 'brief') await modeBrief(config);
   else if (mode === 'prompt') await modePrompt(config);
   else if (mode === 'end') await modeEnd(config);
   else if (mode === 'stop') await modeStop(config);
   else if (mode === 'idle') await modeIdle(config, argv);
   else if (mode === 'precompact') await modePreCompact(config);
+  else if (mode === 'counts') await modeCounts(config);
+  else if (mode === 'watch') await modeWatch();
   else if (mode === 'status') await modeStatus(config, argv);
   else if (mode === 'cut') modeCut(config, argv);
   else if (mode === 'search') await modeSearch(config, argv);
