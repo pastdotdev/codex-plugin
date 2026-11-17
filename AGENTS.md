@@ -17,18 +17,23 @@ Codex
             |
   session start   brief        recall into context; sends idle sessions left behind
   every prompt    prompt       recall into context: ten memories, the block naming the tool
-  on demand       mcp          past_recall, the model's own recall, on a local MCP server
+  on demand       mcp          past_recall, the model's own recall, on a local MCP server;
+                               keeps the watcher going while the hooks wait for a review
   every turn      stop         stamps the activity file, keeps one waiter on the session
   compaction      precompact   sends the sittings that closed; the one still open at most once an hour
   session end     end          makes sure a waiter runs
   detached        idle         the waiter: sends once Codex's process is gone, or after idleMinutes
+  detached        counts       once: the token counts of the sittings already sent
+  detached        watch        while the hooks wait: sends each thread once it is quiet
             |
   ~/.past/config.json          the connection
   ~/.past/state.json           what was sent and what is open, under hosts.codex
   ~/.past/activity/codex/      one file per open session
-  ~/.past/hosts/codex.json     when the hooks last ran, for status
+  ~/.past/hosts/codex.json     when the hooks last ran, on which version, their model and how it is paid for
+  ~/.past/hosts/codex-watch.json   the watcher's process, and when a server last saw it
             |
   POST /api/v1/recall · POST /api/v1/ingest/batch · GET /api/v1/audiences/{slug}
+  PUT /api/v1/agent-tokens
 ```
 
 ```
@@ -134,8 +139,7 @@ Use `updateState` for every change. Keep transcript hashes and pending sessions 
     its moment, a "replaced" mark and the source excerpts) and the prompt hook's ten memories were
     set by measurement: change them with a measurement. The block before a prompt names the tool in
     one line, which is how the model learns to call it; the line rides inside a block the script
-    already drops from what it sends (rule 12), so it changes nothing that travels. Adding the server
-    touched neither `hooks/hooks.json` nor any hook's definition, so no person's trust is reset.
+    already drops from what it sends (rule 12), so it changes nothing that travels.
 14. **A sitting is sent with the connection it was typed under.** `state.json` keeps, per session,
     the connections its prompts were typed under (`connections`, under `hosts.codex`: a fingerprint of the key and the
     address, empty while the machine has no key, each with the time it began; the first covers the
@@ -150,6 +154,67 @@ Use `updateState` for every change. Keep transcript hashes and pending sessions 
     last hash in `sittings`, or `null`, and the session's whole hash is written only once every
     sitting is in past.dev. The folder's path is never sent: `metadata.project` is the folder's
     name. `WAITER_VERSION` went to 7 with it.
+15. **What a session cost travels beside it, never in it.** While `modelUsage` is on (the default),
+    a send carries each sitting's token counts in its item's `agent` object, and a send or a recall
+    carries three headers: `X-Past-Model`, `X-Past-Model-Billing` and `X-Past-Agent-Memory`.
+    past.dev works out from them what it saved. None of it is rendered, so no hash moves (rule 9),
+    and a sitting whose text has not changed is not sent again for its counts.
+    - The counts come from the `token_count` lines Codex writes after each request: the thread's
+      running total, so a stretch of the thread cost the difference between two readings
+      (`tokenMeter`), and a total written twice adds nothing. Cached input and cache writes are
+      taken out of the input figure, which holds them. A reading with none before it, or whose
+      total went down, takes the last request's own figures, since a thread that continues another
+      starts from that one's total. A reading in the copy that opens an imported or forked thread
+      sets where the thread's own counting starts and counts for nobody. A reading belongs to the
+      sitting that was open when it was written, under the model of the `turn_context` before it.
+      A subagent's thread is a rollout of its own, which is never read, so its counts are not sent.
+    - The model on a recall is the one Codex names in the hook's input. The tool and `search` run
+      outside a hook, so they say the model the last hook named, kept in the hook stamp.
+    - How the model is paid for is read from whether an API key variable is set, never from its
+      value, and never from the file that holds Codex's sign-in. A hook reads its own environment
+      and stamps the answer; the tool, a skill's command and the detached processes say what the
+      last hook saw, because Codex hands them a shorter environment.
+    - Codex's own memory is on where `config.toml` sets `memories = true` under `[features]` and
+      does not set `use_memories = false` under `[memories]`; a file that cannot be read says off,
+      which is Codex's default. A profile's own tables are not read.
+    - `counts` mode sends, once, the counts of the sittings already in past.dev whose transcript is
+      still here: ids and counts through `PUT /api/v1/agent-tokens`, with no content. It never goes
+      through ingest. A re-send carries the audience in force now, so it would move a sitting sent
+      under another one, and under another project's key it would be a new paid data point; the
+      route keeps counts for the data points the project holds and ignores every other id.
+      `SessionStart` detaches it while the state's `counts` holds no `doneAt`. It asks with no items
+      first, and where the deployment has no such route it tries again a day later.
+    - `cut` and `status` say what travels beside the text, since that is where a person reads what
+      leaves. `WAITER_VERSION` went to 8 with it.
+
+16. **While the hooks wait for a review, the server keeps the plugin going.** Every release sets
+    the hooks aside until the person reviews them again (see "Codex" below), and Codex starts the
+    recall tool's server all the same. So:
+    - `hookState` reads the hook stamp: `never` with no stamp, `waiting` where the last hook ran on
+      an older version than `VERSION`, `running` otherwise. A stamp from a newer version is a newer
+      copy of the plugin at work beside this one, and counts as running.
+    - The tool's answer opens with one line for the model to pass on (`hooksNotice`), read at the
+      call: a prompt's hook runs before the model can call the tool, so the stamp is current by
+      then. The server's instructions are read when it starts, which can be before the review, so
+      they speak of a conversation that holds no recall block. `status` says it on its Hooks line.
+    - The server looks three seconds after it starts, then every minute (`tendWatcher`), and while
+      the hooks wait it keeps one watcher on the machine (`watch` mode, detached, its pid and the
+      server's last look in `hosts/codex-watch.json`). Nothing in this may print: rule 13.
+    - The watcher takes up the threads written since the hooks last ran (`unwatched`) and sends one
+      once its file has not been written for its sitting length, through `ingestSession`, so what
+      travels is what a hook sends (rule 9). Every sitting is closed by then, since the next turn
+      starts a new one: the watcher never sends a sitting twice. `watched` in the state book holds
+      the file time each thread was last dealt with at; a failed send is tried again later and
+      leaves no mark.
+    - It keeps the hooks' rules without them: an ignored folder and a subagent's thread are left
+      alone, the thread goes on the open list, and the connection it is typed under is recorded at
+      every look (rule 14). `connect` records the old and the new connection for those threads
+      itself, since the watcher looks once a minute.
+    - Hooks that never ran were never trusted: no watcher is started and nothing is sent in their
+      place. Keep it so.
+    - It leaves when the hooks run again or no server has looked for three minutes, once the
+      threads it took up are sent. Bump `WATCH_VERSION` whenever its logic changes, as
+      `WAITER_VERSION` for the waiter: a server replaces a watcher of an older one.
 
 ## Beside other past.dev plugins
 
@@ -160,14 +225,20 @@ activity files in `activity/codex/` and its hook stamp in `hosts/codex.json`. Th
 
 ## Codex
 
-- **The hooks file is written once.** Codex runs no hook that a person has not trusted, and keeps
-  the trust against a hash of each hook's definition, under a key made of the plugin's id, the
-  hooks file's path in the package, the event and the hook's position
-  (`past@past:hooks/hooks.json:stop:0:0`). A new version of the plugin and a changed script keep
-  the hash. An edited definition changes it, and that one hook stops without a word until the
-  person reviews it again. A renamed plugin or marketplace, a moved hooks file and a reordered
-  entry change the key. So `hooks/hooks.json` holds the five events and a mode each, its path and
-  the name `past@past` stay, and every change of behaviour goes into the script. Every hook in it
+- **Every release sets the hooks aside.** Codex runs no hook that a person has not trusted, and
+  keeps the trust under a key made of the plugin's id, the hooks file's path in the package, the
+  event and the hook's position (`past@past:hooks/hooks.json:stop:0:0`), as two hashes: one of the
+  hook's definition, and, since Codex 0.164.0 (openai/codex#54619), one of every file under
+  `plugins/past/`. The version in the manifest is one of those files, so a release changes the
+  second hash whatever else it holds, and all five hooks stop until the person reviews them again.
+  Codex installs a release by itself within a minute of starting, asks for the review where it has
+  a screen, and says nothing in a run that has none. A release therefore costs every person on the
+  plugin one review: put what is ready into one release, and say in its notes that Codex will ask.
+  Rule 16 is what the plugin does meanwhile.
+- **The hooks file is written once.** An edited definition changes that hook's first hash, and a
+  renamed plugin or marketplace, a moved hooks file and a reordered entry change the key: each asks
+  for a review where no release did. So `hooks/hooks.json` holds the five events and a mode each,
+  its path and the name `past@past` stay, and every change of behaviour goes into the script. Every hook in it
   passes `--host codex`, so the flag stays too: the script takes it out before reading its
   arguments, and the skills pass it as well, so a command reads the same wherever it comes from.
 - **`SessionEnd` is a hint.** Codex also fires it when a thread has sat idle for half an hour. A
@@ -226,19 +297,35 @@ activity files in `activity/codex/` and its hook stamp in `hosts/codex.json`. Th
 - Codex writes a `turn_context` line before each turn, with the `model` it runs on and, where one is
   set, the reasoning `effort`. A sitting carries what its last turn ran on; neither is rendered, so
   neither changes a hash (rule 9).
+- An ingest item takes an optional `agent` object beside `metadata`,
+  `{"tokens": {"<model id>": {"input", "cached_input", "cache_write", "output"}}}`, where `input` is
+  the input not read from the cache. Ingest and recall read the three `X-Past-*` headers of rule
+  15. A deployment that knows neither ignores both.
+- `PUT /api/v1/agent-tokens` — `items` of `id` and `agent`, up to 1,000, with no content. It answers
+  how many it kept (`recorded`), how many ids the project does not hold (`unknown`) and how many
+  it could not read (`ignored`); a call with no items answers zeros.
+- Codex writes, after each request, an `event_msg` line of type `token_count` whose
+  `info.total_token_usage` is the thread's running total and `info.last_token_usage` the request's
+  own: `input_tokens`, `cached_input_tokens`, `cache_write_input_tokens` and `output_tokens`. The
+  script takes cached input and cache writes to be part of the input figure; for cache writes that
+  is read off the totals adding up, on rollouts that wrote none, and is to check on one that did.
 - `POST /api/v1/recall` — **`identity` is required**. Recall stays off until `$past:connect` sets
   one. The prompt hook sends `limit` 10; the tool sends `limit` 100 and `maxTokens` 2,000, and reads
   its sources' `excerpts` and `metadata.localTime` and its artifact's `supersededAt` besides each
   result's `content` and `occurredAt`.
 - `audience` on ingest — a slug; absent means the whole project. `connect --audience` checks it
   with `GET /api/v1/audiences/{slug}`.
-- Codex gives a hook `session_id`, `transcript_path` and `cwd`, the prompt as `prompt`, and takes
-  `hookSpecificOutput.additionalContext` at session start and on a prompt.
+- Codex gives a hook `session_id`, `transcript_path`, `cwd` and the `model` it runs on, the prompt
+  as `prompt`, and takes `hookSpecificOutput.additionalContext` at session start and on a prompt.
+- Codex's own memory is off unless `[features] memories = true` is in `config.toml`, and
+  `[memories] use_memories` says whether a session reads it.
 - Codex starts a plugin's MCP server from the `mcpServers` file its manifest names. It expands
   `${PLUGIN_ROOT}` in a hook's command but not in an MCP server's arguments, so `.mcp.json` names the
   script relative to the plugin's root and sets `cwd` to `.`, which Codex resolves to that root. The
   server's environment is Codex's short default list plus the names in `env_vars`, so `PAST_API_KEY`,
-  `PAST_IDENTITY` and `PAST_API_URL` are listed there. `default_tools_approval_mode: "approve"`
+  `PAST_IDENTITY` and `PAST_API_URL` are listed there, and `CODEX_HOME` for the watcher the server
+  starts, which reads the threads on disk. Codex starts one server for each thread, as its own
+  child, whether or not it runs the plugin's hooks, and ends it when the thread's process ends. `default_tools_approval_mode: "approve"`
   approves the one read-only tool in advance: `codex exec` approves nothing, and a person would be
   asked at every call. The server runs outside the sandbox, so the tool reaches past.dev where a
   skill's command would need an escalation.
@@ -262,6 +349,25 @@ mode under test fed its stdin JSON by hand. For the tool, pipe JSON-RPC lines (`
 `tools/list`, `tools/call`) into `node plugins/past/bin/past-hook.mjs mcp` in the same home, with a
 stand-in answering `POST /api/v1/recall`, and check what the request carried.
 
+For rule 15, feed `ingest` a rollout whose `token_count` lines you wrote yourself (a repeated total,
+a model switch between two sittings, cached input) and read the `agent` object of each item: the
+counts are the differences, with cached input taken out of the input. Run the prompt hook with a
+`model` in its input, then the tool, and check that both recalls name it. For `counts`, make the
+stand-in answer `PUT /api/v1/agent-tokens` with 404, then with 200, and run the mode twice each
+time: one empty call and nothing more on 404, one empty call and the items on 200, and nothing at
+all on the second run.
+
+For rule 16, in the same throwaway home, with `CODEX_HOME` on a folder of its own: write
+`hosts/codex.json` with a `lastHookAt` an hour old and an older `version`, write a rollout under
+`sessions/<year>/<month>/<day>/` whose file time is past the sitting length, and run `watch`. One
+batch reaches the stand-in, and a second run sends nothing. Then check each of these sends nothing:
+a rollout older than `lastHookAt`, one in a folder the config's `deny` names, a subagent's, no stamp
+at all, a stamp on this version. With no key in the config, `watch` records the thread under no
+connection; after `connect` and a turn appended to the rollout, only the sitting of that turn goes.
+Pipe `initialize` and a `tools/call` into `mcp` under each stamp: the answer opens with the notice
+while the hooks wait or never ran, and with the memories otherwise; with the input held open five
+seconds, `hosts/codex-watch.json` names a live watcher only while they wait.
+
 On a real Codex:
 
 ```bash
@@ -274,6 +380,8 @@ codex exec --dangerously-bypass-hook-trust "a prompt"     # runs the hooks for t
 end of every run. `codex mcp list` shows the plugin's server, `past`, with its working folder
 resolved to the installed plugin. `CODEX_HOME=<a folder>` gives Codex a home of its own, enough for everything that
 calls no model: installing, and asking the app server what it thinks of the hooks (`codex
-app-server`, then `hooks/list`), which is how to see a hook's key, its hash and whether it is
-trusted. The ChatGPT desktop app carries the same `codex` inside its bundle, for a machine that has
+app-server`, then `hooks/list`), which is how to see a hook's key, its two hashes and whether it is
+trusted: a hook a release set aside reads `modified`. `thread/start` there makes Codex start the
+plugin's server, which is enough to watch it start the watcher under a stamp that says the hooks
+wait. The ChatGPT desktop app carries the same `codex` inside its bundle, for a machine that has
 no terminal install.

@@ -21,5 +21,11 @@ sent: Codex runs no hook that a person has not trusted. Tell the user where to t
 hooks: `/hooks` in a terminal session, or the past.dev plugin's page in the ChatGPT desktop app, where
 **Trust all** does it. Then they send one prompt and ask for the status again.
 
+If the output says the hooks are waiting for a review, Codex updated the plugin and set its hooks
+aside until the user reviews them again. Tell the user where: `/hooks` in a terminal session, or the
+past.dev plugin's page in the ChatGPT desktop app, where **Trust all** does it. Say what the output
+says about the meantime: nothing is recalled before a prompt, and sessions are still sent once they
+go quiet.
+
 If the user asks to check credits now, add `--refresh` to the status command.
 This option reads the balance from the API and clears a credit pause only when the balance is sufficient.

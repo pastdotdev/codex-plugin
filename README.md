@@ -44,7 +44,8 @@ You need Codex and Node 16 or later.
    ones it skips: until this step the plugin does nothing. In a terminal session, `/hooks` lists
    the five past.dev hooks and trusts them. In the desktop app, the plugin's page offers **Trust all**,
    and so does **Settings › Hooks**; if those pages show no hooks, run `/hooks` once in a terminal
-   session, since the trust is shared. An update of the plugin keeps it.
+   session, since the trust is shared. Codex asks for this review again after each update of the
+   plugin: see "After an update" below.
 
 4. **Connect it.**
 
@@ -93,6 +94,23 @@ new sitting; so does the next one after 50 KB of prose, once Codex has answered.
 long thread is remembered on that day, and past.dev can tell which of two statements came later. A
 session that continues sends its last sitting and the new ones again, nothing earlier.
 
+**After an update.** Codex keeps your trust against the plugin's files, so it sets the five hooks aside each time the
+plugin updates, and it installs an update by itself. A terminal session then opens on "5 hooks are
+new or changed": choose **Trust all and continue**. In the desktop app, the past.dev plugin's page
+says the hooks need review and offers **Trust all**. A run with no screen says nothing.
+
+Until you review them:
+
+- nothing is recalled at session start or before a prompt;
+- `past_recall` still answers, and its answer tells Codex that the hooks wait, so that Codex tells
+  you;
+- your sessions are still sent to past.dev, each once it has been quiet for its sitting length (30
+  minutes by default). This holds only where the hooks ran on this machine before: a plugin whose
+  hooks you never trusted sends nothing.
+
+`$past:status` says whether the hooks wait. To stop sending while they do, set `"ingest": false` in
+`~/.past/config.json`, or disable the plugin.
+
 **Recall happens in the hooks.** A tool recalls only when the model decides to call one; a hook
 recalls on every prompt. For questions about history, `$past:search` lets Codex also search past.dev on
 demand, and Codex may pick it by itself when you ask what was decided or whether something was
@@ -104,7 +122,17 @@ Your prompts and Codex's replies, with the names of the project's folder and its
 session's id, the model Codex ran on with its reasoning effort, and the identity you connected
 with. The folder's path stays on your machine. Recall
 sends queries: one when a session starts, the first 1,000 characters of each prompt, and the
-questions Codex asks `past_recall`. Nothing else.
+questions Codex asks `past_recall`.
+
+Beside each sitting and each recall go a few facts about the model, which past.dev uses to show
+what it saved you on the project's Dashboard: the model's name, the token counts Codex recorded
+for the sitting (input, cached input, cache writes and output for each model), how you pay for the
+model (by the token or with a subscription) and whether Codex's own memory is on. How you pay is
+read from
+whether an API key is set in the environment, never from its value, and never from the file that
+holds your sign-in. Once, after the update to 0.5.0, the plugin also sends the token counts of the
+sittings it had already sent: their ids and the counts, with no text. `"modelUsage": false` in
+`~/.past/config.json` sends none of this. Nothing else leaves.
 
 What you type is sent with the key it was typed under, and with no other. Nothing typed before you
 connect is sent, and what was typed under one project's key never goes to another project: a
@@ -153,8 +181,9 @@ slug from the console's **Audiences** page. `$past:connect --audience project` w
 `~/.past/config.json` holds the connection and a few switches: `recall` and `ingest` turn either
 half off, `idleMinutes` (720) is how long a session stays quiet before it is sent,
 `sittingMinutes` (30) is how long a pause starts a new sitting, `sittingKilobytes` (50) how much
-prose does, and `deny` lists paths whose sessions are never read. `PAST_API_KEY`, `PAST_IDENTITY`
-and `PAST_API_URL` override the file.
+prose does, `modelUsage` sends the model's token counts and how it is paid for, and `deny` lists
+paths whose sessions are never read. `PAST_API_KEY`, `PAST_IDENTITY` and `PAST_API_URL` override
+the file.
 Each setting is described in the [plugin's README](plugins/past/README.md#configuration).
 
 For a self-hosted past.dev, pass your deployment's URL as the third argument of `$past:connect`. Use
@@ -168,6 +197,9 @@ than in the conversation.
 - **The hooks never ran.** Status says when they last did. If they never have, they are not
   trusted yet (step 3). If they are trusted and still never run, Codex did not find `node`: it runs
   hooks in a login shell, which reads `~/.zprofile` but not `~/.zshrc`.
+- **The hooks wait for a review.** Status says so after an update of the plugin, with the day they
+  last ran. Review them as in step 3; until then your sessions are still sent, and nothing is
+  recalled before a prompt ("After an update").
 - **Nothing is recalled.** Status has to show a key and an identity: recall needs both. A new
   project has nothing to recall until its first sessions are in; `$past:ingest` sends the current
   one now.
