@@ -1,7 +1,7 @@
 {
   "name": "past",
-  "version": "0.5.0",
-  "description": "Your Codex sessions become memory, and every session starts briefed.",
+  "version": "0.5.1",
+  "description": "One memory for every teammate and every agent on a project. Your Codex sessions go in, and each prompt gets what was decided before, with dated sources.",
   "author": { "name": "past.dev", "url": "https://past.dev" },
   "homepage": "https://github.com/pastdotdev/codex-plugin",
   "repository": "https://github.com/pastdotdev/codex-plugin",
@@ -20,8 +20,8 @@
     "privacyPolicyURL": "https://past.dev/privacy",
     "termsOfServiceURL": "https://past.dev/terms",
     "defaultPrompt": [
-      "Use $past:status to show what past.dev is connected to and what it has sent",
-      "Use $past:search to find what we decided about this, and why"
+      "What did we decide in earlier sessions on this project, and why? Search past.dev.",
+      "What was already tried on this project and dropped? Search past.dev before I start."
     ]
   }
 }
