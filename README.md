@@ -1,6 +1,7 @@
 # past.dev for Codex
 
-Your Codex sessions become memory, and every session opens already briefed.
+One memory for every teammate and every agent on a project. Your Codex sessions go in, and each prompt
+gets what was decided before, with dated sources.
 
 [past.dev](https://past.dev) is memory for AI agents. This plugin connects Codex to a past.dev
 project: what you and Codex say to each other is read into memory as you work, and what matters

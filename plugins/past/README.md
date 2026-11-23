@@ -1,6 +1,7 @@
 # past.dev for Codex
 
-Your Codex sessions become memory, and every session opens already briefed.
+One memory for every teammate and every agent on a project. Your Codex sessions go in, and each prompt
+gets what was decided before, with dated sources.
 
 It runs in the Codex CLI and in local threads of the ChatGPT desktop app, on macOS and Linux.
 
