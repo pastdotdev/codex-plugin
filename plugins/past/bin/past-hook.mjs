@@ -45,7 +45,7 @@ const MIN_SITTING_KILOBYTES = 10;
 const COMPACTION_RESEND_MS = 60 * 60000;
 const DEFAULT_API_URL = 'https://api.past.dev';
 const MARKER = '=== past · recalled from memory ===';
-const VERSION = '0.5.0';
+const VERSION = '0.5.2';
 
 // ---------------------------------------------------------------------------------------- Codex
 

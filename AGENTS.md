@@ -235,6 +235,11 @@ activity files in `activity/codex/` and its hook stamp in `hosts/codex.json`. Th
   a screen, and says nothing in a run that has none. A release therefore costs every person on the
   plugin one review: put what is ready into one release, and say in its notes that Codex will ask.
   Rule 16 is what the plugin does meanwhile.
+- **`VERSION` in the script is the manifest's version, in every release.** Rule 16 knows the hooks
+  wait by comparing it with the version they last ran under. 0.5.1 changed words alone and left
+  the script at 0.5.0, so a person who had reviewed 0.5.0 got neither the notice nor the watcher
+  while 0.5.1 waited for its review; 0.5.2 names itself. The `User-Agent` and the recall tool's
+  server name it too.
 - **The hooks file is written once.** An edited definition changes that hook's first hash, and a
   renamed plugin or marketplace, a moved hooks file and a reordered entry change the key: each asks
   for a review where no release did. So `hooks/hooks.json` holds the five events and a mode each,
