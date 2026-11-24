@@ -45,7 +45,7 @@ const MIN_SITTING_KILOBYTES = 10;
 const COMPACTION_RESEND_MS = 60 * 60000;
 const DEFAULT_API_URL = 'https://api.past.dev';
 const MARKER = '=== past · recalled from memory ===';
-const VERSION = '0.5.2';
+const VERSION = '0.5.3';
 
 // ---------------------------------------------------------------------------------------- Codex
 
@@ -1576,6 +1576,8 @@ async function modeCounts(config) {
   for (const found of listTranscripts(true, '')) {
     const before = sessions[found.sessionId];
     if (!before) continue;
+    // An ignored folder is ignored here too, for a thread sent before the folder was named in deny.
+    if (denied(config, found.dir)) continue;
     const parsed = readTranscript(found.path);
     if (!parsed) continue;
     // Cut as it was sent: a session sent whole is one data point, the others keep their pinned cut.

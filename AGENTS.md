@@ -183,7 +183,9 @@ Use `updateState` for every change. Keep transcript hashes and pending sessions 
       under another one, and under another project's key it would be a new paid data point; the
       route keeps counts for the data points the project holds and ignores every other id.
       `SessionStart` detaches it while the state's `counts` holds no `doneAt`. It asks with no items
-      first, and where the deployment has no such route it tries again a day later.
+      first, and where the deployment has no such route it tries again a day later. A thread
+      started in a folder `deny` names is left out, one sent before the folder was added included
+      (0.5.3; 0.5.0 to 0.5.2 sent its ids and counts).
     - `cut` and `status` say what travels beside the text, since that is where a person reads what
       leaves. `WAITER_VERSION` went to 8 with it.
 
